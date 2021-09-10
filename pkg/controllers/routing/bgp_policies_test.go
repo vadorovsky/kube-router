@@ -45,7 +45,7 @@ func Test_AddPolicies(t *testing.T) {
 				bgpServer:         gobgp.NewBgpServer(),
 				activeNodes:       make(map[string]bool),
 				nodeAsnNumber:     100,
-				podCidr:           "172.20.0.0/24",
+				// podCidrv4:         "172.20.0.0/24",
 			},
 			[]*v1core.Node{
 				{
@@ -182,7 +182,7 @@ func Test_AddPolicies(t *testing.T) {
 				bgpEnableInternal: true,
 				bgpServer:         gobgp.NewBgpServer(),
 				activeNodes:       make(map[string]bool),
-				podCidr:           "172.20.0.0/24",
+				// podCidrv4:         "172.20.0.0/24",
 				globalPeerRouters: []*gobgpapi.Peer{
 					{
 						Conf: &gobgpapi.PeerConf{
@@ -353,7 +353,7 @@ func Test_AddPolicies(t *testing.T) {
 				bgpEnableInternal: false,
 				bgpServer:         gobgp.NewBgpServer(),
 				activeNodes:       make(map[string]bool),
-				podCidr:           "172.20.0.0/24",
+				// podCidrv4:         "172.20.0.0/24",
 				globalPeerRouters: []*gobgpapi.Peer{
 					{
 						Conf: &gobgpapi.PeerConf{
@@ -507,7 +507,7 @@ func Test_AddPolicies(t *testing.T) {
 				bgpFullMeshMode:   false,
 				bgpServer:         gobgp.NewBgpServer(),
 				activeNodes:       make(map[string]bool),
-				podCidr:           "172.20.0.0/24",
+				// podCidrv4:         "172.20.0.0/24",
 				globalPeerRouters: []*gobgpapi.Peer{
 					{
 						Conf: &gobgpapi.PeerConf{
@@ -684,7 +684,7 @@ func Test_AddPolicies(t *testing.T) {
 				bgpFullMeshMode:   false,
 				bgpServer:         gobgp.NewBgpServer(),
 				activeNodes:       make(map[string]bool),
-				podCidr:           "172.20.0.0/24",
+				// podCidrv4:         "172.20.0.0/24",
 				globalPeerRouters: []*gobgpapi.Peer{
 					{
 						Conf: &gobgpapi.PeerConf{
@@ -861,7 +861,7 @@ func Test_AddPolicies(t *testing.T) {
 				bgpServer:         gobgp.NewBgpServer(),
 				advertisePodCidr:  true,
 				activeNodes:       make(map[string]bool),
-				podCidr:           "172.20.0.0/24",
+				// podCidrv4:         "172.20.0.0/24",
 				globalPeerRouters: []*gobgpapi.Peer{
 					{
 						Conf: &gobgpapi.PeerConf{

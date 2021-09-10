@@ -12,11 +12,10 @@ import (
 
 	"github.com/cloudnativelabs/kube-router/pkg/cri"
 	"github.com/cloudnativelabs/kube-router/pkg/metrics"
-	"github.com/cloudnativelabs/kube-router/pkg/utils"
 	"github.com/moby/ipvs"
 	"github.com/vishvananda/netlink"
-	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
+	netutils "k8s.io/utils/net"
 )
 
 // sync the ipvs service and server details configured to reflect the desired state of Kubernetes services
@@ -90,11 +89,65 @@ func (nsc *NetworkServicesController) syncIpvsServices(serviceInfoMap serviceInf
 	return nil
 }
 
+// func (nsc *NetworkServicesController) setupClusterIPService(ipvsSvcs []*ipvs.Service, protocol uint16,
+// 	dummyVipInterface netlink.Link, svc *serviceInfo, endpoints []endpointsInfo,
+// 	activeServiceEndpointMap map[string][]string, clusterIP net.IP) error {
+// 	for _, ipvsSvc := range ipvsSvcs {
+// 		ln := nsc.lnHandlers[ipvsSvc.AddressFamily]
+// 		// assign cluster IP of the service to the dummy interface so that its routable from the pod's on the node
+// 		err := ln.ipAddrAdd(dummyVipInterface, clusterIP.String(), true)
+// 		if err != nil {
+// 			return err
+// 		}
+//
+// 		// create IPVS service for the service to be exposed through the cluster ip
+// 		ipvsClusterVipSvc, err := ln.ipvsAddService(ipvsSvc, clusterIP, protocol, uint16(svc.port),
+// 			svc.sessionAffinity, svc.sessionAffinityTimeoutSeconds, svc.scheduler, svc.flags)
+// 		if err != nil {
+// 			klog.Errorf("Failed to create ipvs service for cluster ip: %s", err.Error())
+// 			return err
+// 		}
+// 		var clusterServiceID = generateIPPortID(clusterIP.String(), svc.protocol, strconv.Itoa(svc.port))
+// 		activeServiceEndpointMap[clusterServiceID] = make([]string, 0)
+//
+// 		// add IPVS remote server to the IPVS service
+// 		for _, endpoint := range endpoints {
+// 			dst := ipvs.Destination{
+// 				Address:       net.ParseIP(endpoint.ip),
+// 				AddressFamily: ipvsSvc.AddressFamily,
+// 				Port:          uint16(endpoint.port),
+// 				Weight:        1,
+// 			}
+// 			// Conditions on which to add an endpoint on this node:
+// 			// 1) Service is not a local service
+// 			// 2) Service is a local service, but has no active endpoints on this node
+// 			// 3) Service is a local service, has active endpoints on this node, and this endpoint is one of them
+// 			if svc.local {
+// 				if hasActiveEndpoints(endpoints) && !endpoint.isLocal {
+// 					// This error is not logged, it's just supposed to trigger
+// 					// the loop continuation.
+// 					return errors.New("endpoint is not local")
+// 				}
+// 			}
+//
+// 			err := ln.ipvsAddServer(ipvsClusterVipSvc, &dst)
+// 			if err != nil {
+// 				klog.Errorf(err.Error())
+// 			} else {
+// 				activeServiceEndpointMap[clusterServiceID] = append(activeServiceEndpointMap[clusterServiceID],
+// 					generateEndpointID(endpoint.ip, strconv.Itoa(endpoint.port)))
+// 			}
+// 		}
+// 	}
+//
+// 	return nil
+// }
+
 func (nsc *NetworkServicesController) setupClusterIPServices(serviceInfoMap serviceInfoMap,
 	endpointsInfoMap endpointsInfoMap, activeServiceEndpointMap map[string][]string) error {
 	ipvsSvcs, err := nsc.ln.ipvsGetServices()
 	if err != nil {
-		return errors.New("Failed get list of IPVS services due to: " + err.Error())
+		return fmt.Errorf("failed get list of IPVS services due to: %w", err)
 	}
 	for k, svc := range serviceInfoMap {
 		var protocol uint16
@@ -111,48 +164,52 @@ func (nsc *NetworkServicesController) setupClusterIPServices(serviceInfoMap serv
 		endpoints := endpointsInfoMap[k]
 		dummyVipInterface, err := nsc.ln.getKubeDummyInterface()
 		if err != nil {
-			return errors.New("Failed creating dummy interface: " + err.Error())
+			return fmt.Errorf("failed creating dummy interface: %w", err)
 		}
 		// assign cluster IP of the service to the dummy interface so that its routable from the pod's on the node
-		err = nsc.ln.ipAddrAdd(dummyVipInterface, svc.clusterIP.String(), true)
-		if err != nil {
-			continue
-		}
-
-		// create IPVS service for the service to be exposed through the cluster ip
-		ipvsClusterVipSvc, err := nsc.ln.ipvsAddService(ipvsSvcs, svc.clusterIP, protocol, uint16(svc.port),
-			svc.sessionAffinity, svc.sessionAffinityTimeoutSeconds, svc.scheduler, svc.flags)
-		if err != nil {
-			klog.Errorf("Failed to create ipvs service for cluster ip: %s", err.Error())
-			continue
-		}
-		var clusterServiceID = generateIPPortID(svc.clusterIP.String(), svc.protocol, strconv.Itoa(svc.port))
-		activeServiceEndpointMap[clusterServiceID] = make([]string, 0)
-
-		// add IPVS remote server to the IPVS service
-		for _, endpoint := range endpoints {
-			dst := ipvs.Destination{
-				Address:       net.ParseIP(endpoint.ip),
-				AddressFamily: syscall.AF_INET,
-				Port:          uint16(endpoint.port),
-				Weight:        1,
-			}
-			// Conditions on which to add an endpoint on this node:
-			// 1) Service is not a local service
-			// 2) Service is a local service, but has no active endpoints on this node
-			// 3) Service is a local service, has active endpoints on this node, and this endpoint is one of them
-			if svc.local {
-				if hasActiveEndpoints(endpoints) && !endpoint.isLocal {
-					continue
-				}
-			}
-
-			err := nsc.ln.ipvsAddServer(ipvsClusterVipSvc, &dst)
+		for clusterIPFamily, clusterIP := range svc.clusterIPs {
+			err = nsc.ln.ipAddrAdd(dummyVipInterface, clusterIP, clusterIPFamily, true)
 			if err != nil {
-				klog.Errorf(err.Error())
-			} else {
-				activeServiceEndpointMap[clusterServiceID] = append(activeServiceEndpointMap[clusterServiceID],
-					generateEndpointID(endpoint.ip, strconv.Itoa(endpoint.port)))
+				continue
+			}
+		}
+
+		// create IPVS services for the service to be exposed through the cluster ip
+		for ipFamily, clusterIP := range svc.clusterIPs {
+			ipvsClusterVipSvc, err := nsc.ln.ipvsAddService(ipvsSvcs, clusterIP, ipFamily, protocol, uint16(svc.port),
+				svc.sessionAffinity, svc.sessionAffinityTimeoutSeconds, svc.scheduler, svc.flags)
+			if err != nil {
+				klog.Errorf("Failed to create ipvs service for cluster ip: %s", err.Error())
+				continue
+			}
+			var clusterServiceID = generateIPPortID(clusterIP.String(), svc.protocol, strconv.Itoa(svc.port))
+			activeServiceEndpointMap[clusterServiceID] = make([]string, 0)
+
+			// add IPVS remote server to the IPVS service
+			for _, endpoint := range endpoints {
+				dst := ipvs.Destination{
+					Address:       net.ParseIP(endpoint.ip),
+					AddressFamily: endpoint.ipFamily,
+					Port:          uint16(endpoint.port),
+					Weight:        1,
+				}
+				// Conditions on which to add an endpoint on this node:
+				// 1) Service is not a local service
+				// 2) Service is a local service, but has no active endpoints on this node
+				// 3) Service is a local service, has active endpoints on this node, and this endpoint is one of them
+				if svc.local {
+					if hasActiveEndpoints(endpoints) && !endpoint.isLocal {
+						continue
+					}
+				}
+
+				err := nsc.ln.ipvsAddServer(ipvsClusterVipSvc, &dst)
+				if err != nil {
+					klog.Errorf(err.Error())
+				} else {
+					activeServiceEndpointMap[clusterServiceID] = append(activeServiceEndpointMap[clusterServiceID],
+						generateEndpointID(endpoint.ip, strconv.Itoa(endpoint.port)))
+				}
 			}
 		}
 	}
@@ -210,29 +267,39 @@ func (nsc *NetworkServicesController) setupNodePortServices(serviceInfoMap servi
 			ipvsNodeportSvcs = make([]*ipvs.Service, len(addrs))
 			nodeServiceIds = make([]string, len(addrs))
 
-			for i, addr := range addrs {
-				ipvsNodeportSvcs[i], err = nsc.ln.ipvsAddService(ipvsSvcs, addr.IP, protocol, uint16(svc.nodePort),
+			for ipFamily, addrs := range addrs {
+				for _, addr := range addrs {
+					ipvsNodeportSvc, err := nsc.ln.ipvsAddService(ipvsSvcs, addr.IP, ipFamily, protocol, uint16(svc.nodePort),
+						svc.sessionAffinity, svc.sessionAffinityTimeoutSeconds, svc.scheduler, svc.flags)
+					if err != nil {
+						klog.Errorf("Failed to create ipvs service for node port due to: %s", err.Error())
+						continue
+					}
+					ipvsNodeportSvcs = append(ipvsNodeportSvcs, ipvsNodeportSvc)
+
+					nodeServiceID := generateIPPortID(addr.IP.String(), svc.protocol, strconv.Itoa(svc.nodePort))
+					nodeServiceIds = append(nodeServiceIds, nodeServiceID)
+					activeServiceEndpointMap[nodeServiceID] = make([]string, 0)
+				}
+			}
+		} else {
+			ipvsNodeportSvcs = make([]*ipvs.Service, 0, 2)
+			nodeServiceIds = make([]string, 0, 2)
+
+			for ipFamily, ipFamilyHandler := range nsc.ipFamilyHandlers {
+				ipvsSvc, err := nsc.ln.ipvsAddService(ipvsSvcs, ipFamilyHandler.NodeIP, ipFamily, protocol, uint16(svc.nodePort),
 					svc.sessionAffinity, svc.sessionAffinityTimeoutSeconds, svc.scheduler, svc.flags)
 				if err != nil {
 					klog.Errorf("Failed to create ipvs service for node port due to: %s", err.Error())
 					continue
 				}
+				ipvsNodeportSvcs = append(ipvsNodeportSvcs, ipvsSvc)
 
-				nodeServiceIds[i] = generateIPPortID(addr.IP.String(), svc.protocol, strconv.Itoa(svc.nodePort))
-				activeServiceEndpointMap[nodeServiceIds[i]] = make([]string, 0)
-			}
-		} else {
-			ipvsNodeportSvcs = make([]*ipvs.Service, 1)
-			ipvsNodeportSvcs[0], err = nsc.ln.ipvsAddService(ipvsSvcs, nsc.nodeIP, protocol, uint16(svc.nodePort),
-				svc.sessionAffinity, svc.sessionAffinityTimeoutSeconds, svc.scheduler, svc.flags)
-			if err != nil {
-				klog.Errorf("Failed to create ipvs service for node port due to: %s", err.Error())
-				continue
-			}
+				id := generateIPPortID(ipFamilyHandler.NodeIP.String(), svc.protocol, strconv.Itoa(svc.nodePort))
+				nodeServiceIds = append(nodeServiceIds, id)
 
-			nodeServiceIds = make([]string, 1)
-			nodeServiceIds[0] = generateIPPortID(nsc.nodeIP.String(), svc.protocol, strconv.Itoa(svc.nodePort))
-			activeServiceEndpointMap[nodeServiceIds[0]] = make([]string, 0)
+				activeServiceEndpointMap[id] = make([]string, 0)
+			}
 		}
 
 		for _, endpoint := range endpoints {
@@ -290,15 +357,15 @@ func (nsc *NetworkServicesController) setupExternalIPServices(serviceInfoMap ser
 		// based on FWMARK to enable Direct server return functionality. DSR requires a director
 		// without a VIP http://www.austintek.com/LVS/LVS-HOWTO/HOWTO/LVS-HOWTO.routing_to_VIP-less_director.html
 		// to avoid martian packets
-		extIPSet := sets.NewString(svc.externalIPs...)
-		if !svc.skipLbIps {
-			extIPSet = extIPSet.Union(sets.NewString(svc.loadBalancerIPs...))
-		}
+		// extIPSet := sets.NewString(svc.externalIPs...)
+		// if !svc.skipLbIps {
+		// 	extIPSet = extIPSet.Union(sets.NewString(svc.loadBalancerIPs...))
+		// }
 
-		if extIPSet.Len() == 0 {
-			// service is not LoadBalancer type and no external IP's are configured
-			continue
-		}
+		// if extIPSet.Len() == 0 {
+		// 	// service is not LoadBalancer type and no external IP's are configured
+		// 	continue
+		// }
 
 		if svc.local && !hasActiveEndpoints(endpoints) {
 			klog.V(1).Infof("Skipping setting up IPVS service for external IP and LoadBalancer IP "+
@@ -307,97 +374,116 @@ func (nsc *NetworkServicesController) setupExternalIPServices(serviceInfoMap ser
 		}
 		mangleTableRulesDump := bytes.Buffer{}
 		var mangleTableRules []string
-		if err := utils.SaveInto("mangle", &mangleTableRulesDump); err != nil {
-			klog.Errorf("Failed to run iptables-save: %s" + err.Error())
-		} else {
-			mangleTableRules = strings.Split(mangleTableRulesDump.String(), "\n")
-		}
-		for _, externalIP := range extIPSet.List() {
-			var externalIPServiceID string
-			if svc.directServerReturn && svc.directServerReturnMethod == tunnelInterfaceType {
-				ipvsExternalIPSvc, err := nsc.ln.ipvsAddFWMarkService(net.ParseIP(externalIP), protocol,
-					uint16(svc.port), svc.sessionAffinity, svc.sessionAffinityTimeoutSeconds, svc.scheduler, svc.flags)
-				if err != nil {
-					klog.Errorf("Failed to create ipvs service for External IP: %s due to: %s",
-						externalIP, err.Error())
-					continue
-				}
-				externalIPServices = append(externalIPServices, externalIPService{ipvsSvc: ipvsExternalIPSvc,
-					externalIP: externalIP})
-				fwMark, err := generateFwmark(externalIP, svc.protocol, strconv.Itoa(svc.port))
-				if err != nil {
-					klog.Errorf("Failed to generate Fwmark")
-					continue
-				}
-				externalIPServiceID = fmt.Sprint(fwMark)
-
-				// ensure there is iptables mangle table rule to FWMARK the packet
-				err = setupMangleTableRule(externalIP, svc.protocol, strconv.Itoa(svc.port), externalIPServiceID,
-					nsc.dsrTCPMSS)
-				if err != nil {
-					klog.Errorf("Failed to setup mangle table rule to FMWARD the traffic to external IP")
-					continue
-				}
-
-				// ensure VIP less director. we dont assign VIP to any interface
-				err = nsc.ln.ipAddrDel(dummyVipInterface, externalIP)
-				if err != nil && err.Error() != IfaceHasNoAddr {
-					klog.Errorf("Failed to delete external ip address from dummyVipInterface due to %s", err)
-					continue
-				}
-				// do policy routing to deliver the packet locally so that IPVS can pick the packet
-				err = routeVIPTrafficToDirector("0x" + fmt.Sprintf("%x", fwMark))
-				if err != nil {
-					klog.Errorf("Failed to setup ip rule to lookup traffic to external IP: %s through custom "+
-						"route table due to %s", externalIP, err.Error())
-					continue
-				}
+		for _, ipFamilyHandler := range nsc.ipFamilyHandlers {
+			if err := ipFamilyHandler.iptablesSaveRestore.SaveInto("mangle", &mangleTableRulesDump); err != nil {
+				klog.Errorf("Failed to run iptables-save: %s" + err.Error())
 			} else {
-				// ensure director with vip assigned
-				err := nsc.ln.ipAddrAdd(dummyVipInterface, externalIP, true)
-				if err != nil && err.Error() != IfaceHasAddr {
-					klog.Errorf("Failed to assign external ip %s to dummy interface %s due to %s",
-						externalIP, KubeDummyIf, err.Error())
-				}
+				mangleTableRules = strings.Split(mangleTableRulesDump.String(), "\n")
+			}
+		}
+		for ipFamily, externalIPs := range svc.externalIPs {
+			loadBalancerIPs := svc.loadBalancerIPs[ipFamily]
+			// extIPSet := sets.NewString(externalIPs...)
+			// extIPSet := sets.NewString()
+			// for _, externalIP := range externalIPs {
+			// 	extIPSet.Insert(externalIP.String())
+			// }
+			if !svc.skipLbIps {
+				// extIPSet = extIPSet.Union(sets.NewString(loadBalancerIPs...))
+				externalIPs = append(externalIPs, loadBalancerIPs...)
+			}
+			// if extIPSet.Len() == 0 {
+			if len(externalIPs) == 0 {
+				// service is not LoadBalancer type and no external IP's are configured
+				continue
+			}
+			for _, externalIP := range externalIPs {
+				var externalIPServiceID string
+				if svc.directServerReturn && svc.directServerReturnMethod == tunnelInterfaceType {
+					ipvsExternalIPSvc, err := nsc.ln.ipvsAddFWMarkService(externalIP, ipFamily, protocol,
+						uint16(svc.port), svc.sessionAffinity, svc.sessionAffinityTimeoutSeconds, svc.scheduler, svc.flags)
+					if err != nil {
+						klog.Errorf("Failed to create ipvs service for External IP: %s due to: %s",
+							externalIP, err.Error())
+						continue
+					}
+					externalIPServices = append(externalIPServices, externalIPService{ipvsSvc: ipvsExternalIPSvc,
+						externalIP: externalIP})
+					fwMark, err := generateFwmark(externalIP.String(), svc.protocol, strconv.Itoa(svc.port))
+					if err != nil {
+						klog.Errorf("Failed to generate Fwmark")
+						continue
+					}
+					externalIPServiceID = fmt.Sprint(fwMark)
 
-				// create IPVS service for the service to be exposed through the external ip
-				ipvsExternalIPSvc, err := nsc.ln.ipvsAddService(ipvsSvcs, net.ParseIP(externalIP), protocol,
-					uint16(svc.port), svc.sessionAffinity, svc.sessionAffinityTimeoutSeconds, svc.scheduler, svc.flags)
-				if err != nil {
-					klog.Errorf("Failed to create ipvs service for external ip: %s due to %s",
-						externalIP, err.Error())
-					continue
-				}
-				externalIPServices = append(externalIPServices, externalIPService{
-					ipvsSvc: ipvsExternalIPSvc, externalIP: externalIP})
-				externalIPServiceID = generateIPPortID(externalIP, svc.protocol, strconv.Itoa(svc.port))
+					// ensure there is iptables mangle table rule to FWMARK the packet
+					err = nsc.setupMangleTableRule(externalIP.String(), svc.protocol, strconv.Itoa(svc.port), externalIPServiceID,
+						nsc.dsrTCPMSS)
+					if err != nil {
+						klog.Errorf("Failed to setup mangle table rule to FMWARD the traffic to external IP")
+						continue
+					}
 
-				// ensure there is NO iptables mangle table rule to FWMARK the packet
-				fwmark, err := generateFwmark(externalIP, svc.protocol, strconv.Itoa(svc.port))
-				if err != nil {
-					klog.Errorf("Failed to generate a fwmark due to " + err.Error())
-					continue
-				}
-				fwMark := fmt.Sprint(fwmark)
-				for _, mangleTableRule := range mangleTableRules {
-					if strings.Contains(mangleTableRule, externalIP) && strings.Contains(mangleTableRule, fwMark) {
-						err = nsc.ln.cleanupMangleTableRule(externalIP, svc.protocol, strconv.Itoa(svc.port), fwMark,
-							nsc.dsrTCPMSS)
-						if err != nil {
-							klog.Errorf("Failed to verify and cleanup any mangle table rule to FMWARD the traffic " +
-								"to external IP due to " + err.Error())
-							continue
+					// ensure VIP less director. we dont assign VIP to any interface
+					err = nsc.ln.ipAddrDel(dummyVipInterface, externalIP, ipFamily)
+					if err != nil && err.Error() != IfaceHasNoAddr {
+						klog.Errorf("Failed to delete external ip address from dummyVipInterface due to %s", err)
+						continue
+					}
+					// do policy routing to deliver the packet locally so that IPVS can pick the packet
+					err = routeVIPTrafficToDirector("0x" + fmt.Sprintf("%x", fwMark))
+					if err != nil {
+						klog.Errorf("Failed to setup ip rule to lookup traffic to external IP: %s through custom "+
+							"route table due to %s", externalIP, err.Error())
+						continue
+					}
+				} else {
+					// ensure director with vip assigned
+					err := nsc.ln.ipAddrAdd(dummyVipInterface, externalIP, ipFamily, true)
+					if err != nil && err.Error() != IfaceHasAddr {
+						klog.Errorf("Failed to assign external ip %s to dummy interface %s due to %s",
+							externalIP, KubeDummyIf, err.Error())
+					}
+
+					// create IPVS service for the service to be exposed through the external ip
+					ipvsExternalIPSvc, err := nsc.ln.ipvsAddService(ipvsSvcs, externalIP, ipFamily, protocol,
+						uint16(svc.port), svc.sessionAffinity, svc.sessionAffinityTimeoutSeconds, svc.scheduler, svc.flags)
+					if err != nil {
+						klog.Errorf("Failed to create ipvs service for external ip: %s due to %s",
+							externalIP, err.Error())
+						continue
+					}
+					externalIPServices = append(externalIPServices, externalIPService{
+						ipvsSvc: ipvsExternalIPSvc, externalIP: externalIP})
+					externalIPServiceID = generateIPPortID(externalIP.String(), svc.protocol, strconv.Itoa(svc.port))
+
+					// ensure there is NO iptables mangle table rule to FWMARK the packet
+					fwmark, err := generateFwmark(externalIP.String(), svc.protocol, strconv.Itoa(svc.port))
+					if err != nil {
+						klog.Errorf("Failed to generate a fwmark due to " + err.Error())
+						continue
+					}
+					fwMark := fmt.Sprint(fwmark)
+					for _, mangleTableRule := range mangleTableRules {
+						if strings.Contains(mangleTableRule, externalIP.String()) && strings.Contains(mangleTableRule, fwMark) {
+							err = nsc.ln.cleanupMangleTableRule(externalIP.String(), svc.protocol, strconv.Itoa(svc.port), fwMark,
+								nsc.dsrTCPMSS)
+							if err != nil {
+								klog.Errorf("Failed to verify and cleanup any mangle table rule to FMWARD the traffic " +
+									"to external IP due to " + err.Error())
+								continue
+							}
 						}
 					}
 				}
-			}
 
-			activeServiceEndpointMap[externalIPServiceID] = make([]string, 0)
-			for _, endpoint := range endpoints {
-				if !svc.local || (svc.local && endpoint.isLocal) {
-					activeServiceEndpointMap[externalIPServiceID] =
-						append(activeServiceEndpointMap[externalIPServiceID],
-							generateEndpointID(endpoint.ip, strconv.Itoa(endpoint.port)))
+				activeServiceEndpointMap[externalIPServiceID] = make([]string, 0)
+				for _, endpoint := range endpoints {
+					if !svc.local || (svc.local && endpoint.isLocal) {
+						activeServiceEndpointMap[externalIPServiceID] =
+							append(activeServiceEndpointMap[externalIPServiceID],
+								generateEndpointID(endpoint.ip, strconv.Itoa(endpoint.port)))
+					}
 				}
 			}
 		}
@@ -437,7 +523,18 @@ func (nsc *NetworkServicesController) setupExternalIPServices(serviceInfoMap ser
 					}
 
 					// we are only concerned with endpoint pod running on current node
-					if strings.Compare(podObj.Status.HostIP, nsc.nodeIP.String()) != 0 {
+					hostIP := net.ParseIP(podObj.Status.HostIP)
+					if hostIP == nil {
+						klog.Errorf("Failed to find host IP of pod %s associated with the endpoint %s",
+							podObj.ObjectMeta.Name, endpoint.ip)
+						continue
+					}
+					if netutils.IsIPv4(hostIP) && strings.Compare(
+						podObj.Status.HostIP, nsc.ipFamilyHandlers[syscall.AF_INET].NodeIP.String()) != 0 {
+						continue
+					}
+					if netutils.IsIPv6(hostIP) && strings.Compare(
+						podObj.Status.HostIP, nsc.ipFamilyHandlers[syscall.AF_INET6].NodeIP.String()) != 0 {
 						continue
 					}
 
@@ -458,7 +555,7 @@ func (nsc *NetworkServicesController) setupExternalIPServices(serviceInfoMap ser
 					if runtime == "docker" {
 						// WARN: This method is deprecated and will be removed once docker-shim is removed from kubelet.
 						err = nsc.ln.prepareEndpointForDsrWithDocker(containerID, endpoint.ip,
-							externalIPService.externalIP)
+							externalIPService.externalIP.String(), endpoint.ipFamily)
 						if err != nil {
 							klog.Errorf("Failed to prepare endpoint %s to do direct server return due to %s",
 								endpoint.ip, err.Error())
@@ -467,7 +564,7 @@ func (nsc *NetworkServicesController) setupExternalIPServices(serviceInfoMap ser
 						// We expect CRI compliant runtimes here
 						// ugly workaround, refactoring of pkg/Proxy is required
 						err = nsc.ln.(*linuxNetworking).prepareEndpointForDsrWithCRI(nsc.dsr.runtimeEndpoint,
-							containerID, endpoint.ip, externalIPService.externalIP)
+							containerID, endpoint.ip, externalIPService.externalIP.String(), endpoint.ipFamily)
 						if err != nil {
 							klog.Errorf("Failed to prepare endpoint %s to do DSR due to: %s",
 								endpoint.ip, err.Error())
@@ -521,20 +618,22 @@ func (nsc *NetworkServicesController) cleanupStaleVIPs(activeServiceEndpointMap 
 	if err != nil {
 		return errors.New("Failed creating dummy interface: " + err.Error())
 	}
-	var addrs []netlink.Addr
-	addrs, err = netlink.AddrList(dummyVipInterface, netlink.FAMILY_V4)
-	if err != nil {
-		return errors.New("Failed to list dummy interface IPs: " + err.Error())
-	}
-	for _, addr := range addrs {
-		isActive := addrActive[addr.IP.String()]
-		if !isActive {
-			klog.V(1).Infof("Found an IP %s which is no longer needed so cleaning up", addr.IP.String())
-			err := nsc.ln.ipAddrDel(dummyVipInterface, addr.IP.String())
-			if err != nil {
-				klog.Errorf("Failed to delete stale IP %s due to: %s",
-					addr.IP.String(), err.Error())
-				continue
+	for ipFamily := range nsc.ipFamilyHandlers {
+		var addrs []netlink.Addr
+		addrs, err = netlink.AddrList(dummyVipInterface, int(ipFamily))
+		if err != nil {
+			return fmt.Errorf("failed to list dummy interface IPs: %w", err)
+		}
+		for _, addr := range addrs {
+			isActive := addrActive[addr.IP.String()]
+			if !isActive {
+				klog.V(1).Infof("Found an IP %s which is no longer needed so cleaning up", addr.IP.String())
+				err := nsc.ln.ipAddrDel(dummyVipInterface, addr.IP, ipFamily)
+				if err != nil {
+					klog.Errorf("Failed to delete stale IP %s due to: %s",
+						addr.IP.String(), err.Error())
+					continue
+				}
 			}
 		}
 	}

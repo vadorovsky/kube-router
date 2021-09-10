@@ -23,11 +23,14 @@ func (nrc *NetworkRoutingController) enablePolicyBasedRouting() error {
 		return fmt.Errorf("failed to verify if `ip rule` exists: %s", err.Error())
 	}
 
-	if !strings.Contains(string(out), nrc.podCidr) {
-		// nolint:gosec // this exec should be safe from command injection given the parameter's context
-		err = exec.Command("ip", "rule", "add", "from", nrc.podCidr, "lookup", customRouteTableID).Run()
-		if err != nil {
-			return fmt.Errorf("failed to add ip rule due to: %s", err.Error())
+	// if nrc.enableIPv4 {
+	for _, ipFamilyHandler := range nrc.ipFamilyHandlers {
+		if !strings.Contains(string(out), ipFamilyHandler.PodCidr) {
+			// nolint:gosec // this exec should be safe from command injection given the parameter's context
+			err = exec.Command("ip", "rule", "add", "from", ipFamilyHandler.PodCidr, "lookup", customRouteTableID).Run()
+			if err != nil {
+				return fmt.Errorf("failed to add ip rule due to: %w", err)
+			}
 		}
 	}
 
@@ -46,11 +49,14 @@ func (nrc *NetworkRoutingController) disablePolicyBasedRouting() error {
 			err.Error())
 	}
 
-	if strings.Contains(string(out), nrc.podCidr) {
-		// nolint:gosec // this exec should be safe from command injection given the parameter's context
-		err = exec.Command("ip", "rule", "del", "from", nrc.podCidr, "table", customRouteTableID).Run()
-		if err != nil {
-			return fmt.Errorf("failed to delete ip rule: %s", err.Error())
+	// if nrc.enableIPv4 {
+	for _, ipFamilyHandler := range nrc.ipFamilyHandlers {
+		if strings.Contains(string(out), ipFamilyHandler.PodCidr) {
+			// nolint:gosec // this exec should be safe from command injection given the parameter's context
+			err = exec.Command("ip", "rule", "del", "from", ipFamilyHandler.PodCidr, "table", customRouteTableID).Run()
+			if err != nil {
+				return fmt.Errorf("failed to delete ip rule: %w", err)
+			}
 		}
 	}
 

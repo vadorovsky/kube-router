@@ -9,6 +9,7 @@ import (
 
 	"github.com/containernetworking/cni/libcni"
 	"github.com/containernetworking/plugins/plugins/ipam/host-local/backend/allocator"
+	v1core "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
 )
 
@@ -120,25 +121,56 @@ func InsertPodCidrInCniSpec(cniConfFilePath string, cidr string) error {
 	return nil
 }
 
-// GetPodCidrFromNodeSpec reads the pod CIDR allocated to the node from API node object and returns it
-func GetPodCidrFromNodeSpec(clientset kubernetes.Interface, hostnameOverride string) (string, error) {
-	node, err := GetNodeObject(clientset, hostnameOverride)
-	if err != nil {
-		return "", fmt.Errorf("Failed to get pod CIDR allocated for the node due to: " + err.Error())
+func GetPodCidrsFromNodeSpec(node *v1core.Node) (string, string, error) {
+	var podCidrv4, podCidrv6 string
+
+	if cidrs, ok := node.Annotations[podCIDRAnnotation]; ok {
+		for _, cidr := range strings.Split(cidrs, ",") {
+			ipAddr, _, err := net.ParseCIDR(cidr)
+			if err != nil {
+				return "", "", fmt.Errorf("error parsing pod CIDR in node annotation: %w", err)
+			}
+
+			switch len(ipAddr) {
+			case net.IPv4len:
+				if podCidrv4 == "" {
+					podCidrv4 = cidr
+				}
+			case net.IPv6len:
+				if podCidrv6 == "" {
+					podCidrv6 = cidr
+				}
+			}
+		}
 	}
 
-	if cidr, ok := node.Annotations[podCIDRAnnotation]; ok {
-		_, _, err = net.ParseCIDR(cidr)
+	for _, cidr := range node.Spec.PodCIDRs {
+		ipAddr, _, err := net.ParseCIDR(cidr)
 		if err != nil {
-			return "", fmt.Errorf("error parsing pod CIDR in node annotation: %v", err)
+			return "", "", fmt.Errorf("error parsing pod CIDR in node spec: %w", err)
 		}
 
-		return cidr, nil
+		switch len(ipAddr) {
+		case net.IPv4len:
+			if podCidrv4 == "" {
+				podCidrv4 = cidr
+			}
+		case net.IPv6len:
+			if podCidrv6 == "" {
+				podCidrv6 = cidr
+			}
+		}
 	}
 
-	if node.Spec.PodCIDR == "" {
-		return "", fmt.Errorf("node.Spec.PodCIDR not set for node: %v", node.Name)
+	return podCidrv4, podCidrv6, nil
+}
+
+func GetPodCidrsFromNodeSpecByHostname(clientset kubernetes.Interface,
+	hostnameOverride string) (string, string, error) {
+	node, err := GetNodeObject(clientset, hostnameOverride)
+	if err != nil {
+		return "", "", fmt.Errorf("Failed to get pod CIDR allocated for the node due to: " + err.Error())
 	}
 
-	return node.Spec.PodCIDR, nil
+	return GetPodCidrsFromNodeSpec(node)
 }

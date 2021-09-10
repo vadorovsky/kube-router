@@ -7,6 +7,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/cloudnativelabs/kube-router/pkg/metrics"
@@ -18,6 +19,56 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 )
+
+func (nrc *NetworkRoutingController) newBGPPeer(node *v1core.Node, nodeIP string,
+	familyAfi gobgpapi.Family_Afi) *gobgpapi.Peer {
+	n := &gobgpapi.Peer{
+		Conf: &gobgpapi.PeerConf{
+			NeighborAddress: nodeIP,
+			PeerAs:          nrc.nodeAsnNumber,
+		},
+		Transport: &gobgpapi.Transport{
+			RemotePort: nrc.bgpPort,
+		},
+	}
+
+	if nrc.bgpGracefulRestart {
+		n.GracefulRestart = &gobgpapi.GracefulRestart{
+			Enabled:         true,
+			RestartTime:     uint32(nrc.bgpGracefulRestartTime.Seconds()),
+			DeferralTime:    uint32(nrc.bgpGracefulRestartDeferralTime.Seconds()),
+			LocalRestarting: true,
+		}
+
+		n.AfiSafis = []*gobgpapi.AfiSafi{
+			{
+				Config: &gobgpapi.AfiSafiConfig{
+					Family:  &gobgpapi.Family{Afi: familyAfi, Safi: gobgpapi.Family_SAFI_UNICAST},
+					Enabled: true,
+				},
+				MpGracefulRestart: &gobgpapi.MpGracefulRestart{
+					Config: &gobgpapi.MpGracefulRestartConfig{
+						Enabled: true,
+					},
+					State: &gobgpapi.MpGracefulRestartState{},
+				},
+			},
+		}
+	}
+
+	// we are rr-server peer with other rr-client with reflection enabled
+	if nrc.bgpRRServer {
+		if _, ok := node.ObjectMeta.Annotations[rrClientAnnotation]; ok {
+			// add rr options with clusterId
+			n.RouteReflector = &gobgpapi.RouteReflector{
+				RouteReflectorClient:    true,
+				RouteReflectorClusterId: fmt.Sprint(nrc.bgpClusterID),
+			}
+		}
+	}
+
+	return n
+}
 
 // Refresh the peer relationship with rest of the nodes in the cluster (iBGP peers). Node add/remove
 // events should ensure peer relationship with only currently active nodes. In case
@@ -46,15 +97,22 @@ func (nrc *NetworkRoutingController) syncInternalPeers() {
 	currentNodes := make([]string, 0)
 	for _, obj := range nodes {
 		node := obj.(*v1core.Node)
-		nodeIP, err := utils.GetNodeIP(node)
+		nodeIPv4, nodeIPv6, err := utils.GetNodeIP(node, nrc.enableIPv4, nrc.enableIPv6)
 		if err != nil {
 			klog.Errorf("Failed to find a node IP and therefore cannot sync internal BGP Peer: %v", err)
 			continue
 		}
 
 		// skip self
-		if nodeIP.String() == nrc.nodeIP.String() {
-			continue
+		if nrc.enableIPv4 {
+			if nodeIPv4.String() == nrc.ipFamilyHandlers[syscall.AF_INET].NodeIP.String() {
+				continue
+			}
+		}
+		if nrc.enableIPv6 {
+			if nodeIPv6.String() == nrc.ipFamilyHandlers[syscall.AF_INET6].NodeIP.String() {
+				continue
+			}
 		}
 
 		// we are rr-client peer only with rr-server
@@ -69,91 +127,57 @@ func (nrc *NetworkRoutingController) syncInternalPeers() {
 		if !nrc.bgpFullMeshMode {
 			nodeasn, ok := node.ObjectMeta.Annotations[nodeASNAnnotation]
 			if !ok {
-				klog.Infof("Not peering with the Node %s as ASN number of the node is unknown.",
-					nodeIP.String())
+				if nrc.enableIPv4 {
+					klog.Infof("Not peering with the Node %s as ASN number of the node is unknown.",
+						nrc.ipFamilyHandlers[syscall.AF_INET].NodeIP.String())
+				}
+				if nrc.enableIPv6 {
+					klog.Infof("Not peering with the Node %s as ASN number of the node is unknown.",
+						nrc.ipFamilyHandlers[syscall.AF_INET6].NodeIP.String())
+				}
 				continue
 			}
 
 			asnNo, err := strconv.ParseUint(nodeasn, 0, asnMaxBitSize)
 			if err != nil {
-				klog.Infof("Not peering with the Node %s as ASN number of the node is invalid.",
-					nodeIP.String())
+				if nrc.enableIPv4 {
+					klog.Infof("Not peering with the Node %s as ASN number of the node is invalid.",
+						nrc.ipFamilyHandlers[syscall.AF_INET].NodeIP.String())
+				}
+				if nrc.enableIPv6 {
+					klog.Infof("Not peering with the Node %s as ASN number of the node is invalid.",
+						nrc.ipFamilyHandlers[syscall.AF_INET6].NodeIP.String())
+				}
 				continue
 			}
 
 			// if the nodes ASN number is different from ASN number of current node skip peering
 			if nrc.nodeAsnNumber != uint32(asnNo) {
-				klog.Infof("Not peering with the Node %s as ASN number of the node is different.",
-					nodeIP.String())
+				if nrc.enableIPv4 {
+					klog.Infof("Not peering with the Node %s as ASN number of the node is different.",
+						nrc.ipFamilyHandlers[syscall.AF_INET].NodeIP.String())
+				}
+				if nrc.enableIPv6 {
+					klog.Infof("Not peering with the Node %s as ASN number of the node is different.",
+						nrc.ipFamilyHandlers[syscall.AF_INET6].NodeIP.String())
+				}
 				continue
 			}
 		}
 
-		currentNodes = append(currentNodes, nodeIP.String())
-		nrc.activeNodes[nodeIP.String()] = true
-		n := &gobgpapi.Peer{
-			Conf: &gobgpapi.PeerConf{
-				NeighborAddress: nodeIP.String(),
-				PeerAs:          nrc.nodeAsnNumber,
-			},
-			Transport: &gobgpapi.Transport{
-				RemotePort: nrc.bgpPort,
-			},
-		}
+		// if nrc.enableIPv4 {
+		for _, ipFamilyHandler := range nrc.ipFamilyHandlers {
+			currentNodes = append(currentNodes, ipFamilyHandler.NodeIP.String())
+			nrc.activeNodes[ipFamilyHandler.NodeIP.String()] = true
+			n := nrc.newBGPPeer(node, ipFamilyHandler.NodeIP.String(), ipFamilyHandler.afi)
 
-		if nrc.bgpGracefulRestart {
-			n.GracefulRestart = &gobgpapi.GracefulRestart{
-				Enabled:         true,
-				RestartTime:     uint32(nrc.bgpGracefulRestartTime.Seconds()),
-				DeferralTime:    uint32(nrc.bgpGracefulRestartDeferralTime.Seconds()),
-				LocalRestarting: true,
-			}
-
-			n.AfiSafis = []*gobgpapi.AfiSafi{
-				{
-					Config: &gobgpapi.AfiSafiConfig{
-						Family:  &gobgpapi.Family{Afi: gobgpapi.Family_AFI_IP, Safi: gobgpapi.Family_SAFI_UNICAST},
-						Enabled: true,
-					},
-					MpGracefulRestart: &gobgpapi.MpGracefulRestart{
-						Config: &gobgpapi.MpGracefulRestartConfig{
-							Enabled: true,
-						},
-						State: &gobgpapi.MpGracefulRestartState{},
-					},
-				},
-				{
-					Config: &gobgpapi.AfiSafiConfig{
-						Family:  &gobgpapi.Family{Afi: gobgpapi.Family_AFI_IP6, Safi: gobgpapi.Family_SAFI_UNICAST},
-						Enabled: true,
-					},
-					MpGracefulRestart: &gobgpapi.MpGracefulRestart{
-						Config: &gobgpapi.MpGracefulRestartConfig{
-							Enabled: true,
-						},
-						State: &gobgpapi.MpGracefulRestartState{},
-					},
-				},
-			}
-		}
-
-		// we are rr-server peer with other rr-client with reflection enabled
-		if nrc.bgpRRServer {
-			if _, ok := node.ObjectMeta.Annotations[rrClientAnnotation]; ok {
-				// add rr options with clusterId
-				n.RouteReflector = &gobgpapi.RouteReflector{
-					RouteReflectorClient:    true,
-					RouteReflectorClusterId: fmt.Sprint(nrc.bgpClusterID),
+			// TODO: check if a node is already added as neighbor in a better way than add and catch error
+			if err := nrc.bgpServer.AddPeer(context.Background(), &gobgpapi.AddPeerRequest{
+				Peer: n,
+			}); err != nil {
+				if !strings.Contains(err.Error(), "can't overwrite the existing peer") {
+					klog.Errorf("Failed to add node %s as peer due to %s", ipFamilyHandler.NodeIP.String(), err)
 				}
-			}
-		}
-
-		// TODO: check if a node is already added as neighbor in a better way than add and catch error
-		if err := nrc.bgpServer.AddPeer(context.Background(), &gobgpapi.AddPeerRequest{
-			Peer: n,
-		}); err != nil {
-			if !strings.Contains(err.Error(), "can't overwrite the existing peer") {
-				klog.Errorf("Failed to add node %s as peer due to %s", nodeIP.String(), err)
 			}
 		}
 	}
@@ -298,14 +322,19 @@ func (nrc *NetworkRoutingController) newNodeEventHandler() cache.ResourceEventHa
 	return cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			node := obj.(*v1core.Node)
-			nodeIP, err := utils.GetNodeIP(node)
+			nodeIPv4, nodeIPv6, err := utils.GetNodeIP(node, nrc.enableIPv4, nrc.enableIPv6)
 			if err != nil {
 				klog.Errorf(
 					"New node received, but we were unable to add it as we were couldn't find its node IP: %v", err)
 				return
 			}
 
-			klog.V(2).Infof("Received node %s added update from watch API so peer with new node", nodeIP)
+			if nrc.enableIPv4 {
+				klog.V(2).Infof("Received node %s added update from watch API so peer with new node", nodeIPv4)
+			}
+			if nrc.enableIPv6 {
+				klog.V(2).Infof("Received node %s added update from watch API so peer with new node", nodeIPv6)
+			}
 			nrc.OnNodeUpdate(obj)
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
@@ -324,11 +353,16 @@ func (nrc *NetworkRoutingController) newNodeEventHandler() cache.ResourceEventHa
 					return
 				}
 			}
-			nodeIP, err := utils.GetNodeIP(node)
+			nodeIPv4, nodeIPv6, err := utils.GetNodeIP(node, nrc.enableIPv4, nrc.enableIPv6)
 			// In this case even if we can't get the NodeIP that's alright as the node is being removed anyway and
 			// future node lister operations that happen in OnNodeUpdate won't be affected as the node won't be returned
 			if err == nil {
-				klog.Infof("Received node %s removed update from watch API, so remove node from peer", nodeIP)
+				if nrc.enableIPv4 {
+					klog.Infof("Received node %s removed update from watch API, so remove node from peer", nodeIPv4)
+				}
+				if nrc.enableIPv6 {
+					klog.Infof("Received node %s removed update from watch API, so remove node from peer", nodeIPv6)
+				}
 			} else {
 				klog.Infof("Received node (IP unavailable) removed update from watch API, so remove node " +
 					"from peer")

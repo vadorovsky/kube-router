@@ -33,7 +33,8 @@ func attemptNamespaceResetAfterError(hostNSHandle netns.NsHandle) {
 }
 
 func (ln *linuxNetworking) configureContainerForDSR(
-	vip, endpointIP, containerID string, pid int, hostNetworkNamespaceHandle netns.NsHandle) error {
+	vip, endpointIP string, ipFamily uint16, containerID string, pid int,
+	hostNetworkNamespaceHandle netns.NsHandle) error {
 	endpointNamespaceHandle, err := netns.GetFromPid(pid)
 	if err != nil {
 		return fmt.Errorf("failed to get endpoint namespace (containerID=%s, pid=%d, error=%v)",
@@ -114,7 +115,7 @@ func (ln *linuxNetworking) configureContainerForDSR(
 	}
 
 	// assign VIP to the KUBE_TUNNEL_IF interface
-	err = ln.ipAddrAdd(tunIf, vip, false)
+	err = ln.ipAddrAdd(tunIf, net.ParseIP(vip), ipFamily, false)
 	if err != nil && err.Error() != IfaceHasAddr {
 		attemptNamespaceResetAfterError(hostNetworkNamespaceHandle)
 		return fmt.Errorf("failed to assign vip %s to kube-tunnel-if interface", vip)

@@ -85,58 +85,60 @@ func (npc *NetworkPolicyController) syncNetworkPolicyChains(networkPoliciesInfo 
 		klog.V(1).Infof("Returned ipset mutex lock")
 	}()
 
-	ipset, err := utils.NewIPSet(false)
-	if err != nil {
-		return nil, nil, err
-	}
-	err = ipset.Save()
-	if err != nil {
-		return nil, nil, err
-	}
-	npc.ipSetHandler = ipset
-
 	activePolicyChains := make(map[string]bool)
 	activePolicyIPSets := make(map[string]bool)
 
-	// run through all network policies
-	for _, policy := range networkPoliciesInfo {
-
-		// ensure there is a unique chain per network policy in filter table
-		policyChainName := networkPolicyChainName(policy.namespace, policy.name, version)
-		npc.filterTableRules.WriteString(":" + policyChainName + "\n")
-
-		activePolicyChains[policyChainName] = true
-
-		currentPodIPs := make([]string, 0, len(policy.targetPods))
-		for ip := range policy.targetPods {
-			currentPodIPs = append(currentPodIPs, ip)
+	for ipFamily := range npc.ipFamilyHandlers {
+		ipset, err := utils.NewIPSet(ipFamily)
+		if err != nil {
+			return nil, nil, err
 		}
+		err = ipset.Save()
+		if err != nil {
+			return nil, nil, err
+		}
+		npc.ipSetHandler = ipset
 
-		if policy.policyType == kubeBothPolicyType || policy.policyType == kubeIngressPolicyType {
-			// create a ipset for all destination pod ip's matched by the policy spec PodSelector
-			targetDestPodIPSetName := policyDestinationPodIPSetName(policy.namespace, policy.name)
-			npc.createGenericHashIPSet(targetDestPodIPSetName, utils.TypeHashIP, currentPodIPs)
-			err = npc.processIngressRules(policy, targetDestPodIPSetName, activePolicyIPSets, version)
-			if err != nil {
-				return nil, nil, err
+		// run through all network policies
+		for _, policy := range networkPoliciesInfo {
+
+			// ensure there is a unique chain per network policy in filter table
+			policyChainName := networkPolicyChainName(policy.namespace, policy.name, version)
+			npc.filterTableRules.WriteString(":" + policyChainName + "\n")
+
+			activePolicyChains[policyChainName] = true
+
+			currentPodIPs := make([]string, 0, len(policy.targetPods))
+			for ip := range policy.targetPods {
+				currentPodIPs = append(currentPodIPs, ip)
 			}
-			activePolicyIPSets[targetDestPodIPSetName] = true
-		}
-		if policy.policyType == kubeBothPolicyType || policy.policyType == kubeEgressPolicyType {
-			// create a ipset for all source pod ip's matched by the policy spec PodSelector
-			targetSourcePodIPSetName := policySourcePodIPSetName(policy.namespace, policy.name)
-			npc.createGenericHashIPSet(targetSourcePodIPSetName, utils.TypeHashIP, currentPodIPs)
-			err = npc.processEgressRules(policy, targetSourcePodIPSetName, activePolicyIPSets, version)
-			if err != nil {
-				return nil, nil, err
-			}
-			activePolicyIPSets[targetSourcePodIPSetName] = true
-		}
-	}
 
-	err = npc.ipSetHandler.Restore()
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to perform ipset restore: %s", err.Error())
+			if policy.policyType == kubeBothPolicyType || policy.policyType == kubeIngressPolicyType {
+				// create a ipset for all destination pod ip's matched by the policy spec PodSelector
+				targetDestPodIPSetName := policyDestinationPodIPSetName(policy.namespace, policy.name)
+				npc.createGenericHashIPSet(targetDestPodIPSetName, utils.TypeHashIP, currentPodIPs)
+				err = npc.processIngressRules(policy, targetDestPodIPSetName, activePolicyIPSets, version)
+				if err != nil {
+					return nil, nil, err
+				}
+				activePolicyIPSets[targetDestPodIPSetName] = true
+			}
+			if policy.policyType == kubeBothPolicyType || policy.policyType == kubeEgressPolicyType {
+				// create a ipset for all source pod ip's matched by the policy spec PodSelector
+				targetSourcePodIPSetName := policySourcePodIPSetName(policy.namespace, policy.name)
+				npc.createGenericHashIPSet(targetSourcePodIPSetName, utils.TypeHashIP, currentPodIPs)
+				err = npc.processEgressRules(policy, targetSourcePodIPSetName, activePolicyIPSets, version)
+				if err != nil {
+					return nil, nil, err
+				}
+				activePolicyIPSets[targetSourcePodIPSetName] = true
+			}
+		}
+
+		err = npc.ipSetHandler.Restore()
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to perform ipset restore: %s", err.Error())
+		}
 	}
 
 	klog.V(2).Infof("Iptables chains in the filter table are synchronized with the network policies.")

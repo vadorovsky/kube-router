@@ -123,30 +123,34 @@ func Test_InsertPodCidrInCniSpec(t *testing.T) {
 	}
 }
 
-func Test_GetPodCidrFromNodeSpec(t *testing.T) {
+func Test_GetPodCidrsFromNodeSpec(t *testing.T) {
 	testcases := []struct {
 		name             string
 		hostnameOverride string
 		existingNode     *apiv1.Node
-		podCIDR          string
+		podCIDRv4        string
+		podCIDRv6        string
 		err              error
 	}{
 		{
-			"node with node.Spec.PodCIDR",
+			"node with node.Spec.PodCIDR (IPv4)",
 			"test-node",
 			&apiv1.Node{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "test-node",
 				},
 				Spec: apiv1.NodeSpec{
-					PodCIDR: "172.17.0.0/24",
+					PodCIDRs: []string{
+						"172.17.0.0/24",
+					},
 				},
 			},
 			"172.17.0.0/24",
+			"",
 			nil,
 		},
 		{
-			"node with node.Annotations['kube-router.io/pod-cidr']",
+			"node with node.Annotations['kube-router.io/pod-cidr'] (IPv4)",
 			"test-node",
 			&apiv1.Node{
 				ObjectMeta: metav1.ObjectMeta{
@@ -157,6 +161,72 @@ func Test_GetPodCidrFromNodeSpec(t *testing.T) {
 				},
 			},
 			"172.17.0.0/24",
+			"",
+			nil,
+		},
+		{
+			"node with node.Spec.PodCIDR (IPv6)",
+			"test-node",
+			&apiv1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-node",
+				},
+				Spec: apiv1.NodeSpec{
+					PodCIDRs: []string{
+						"2001:db8:42:1::/112",
+					},
+				},
+			},
+			"",
+			"2001:db8:42:1::/112",
+			nil,
+		},
+		{
+			"node with node.Annotations['kube-router.io/pod-cidr'] (IPv6)",
+			"test-node",
+			&apiv1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-node",
+					Annotations: map[string]string{
+						podCIDRAnnotation: "2001:db8:42:1::/112",
+					},
+				},
+			},
+			"",
+			"2001:db8:42:1::/112",
+			nil,
+		},
+		{
+			"node with node.Spec.PodCIDR (dual-stack)",
+			"test-node",
+			&apiv1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-node",
+				},
+				Spec: apiv1.NodeSpec{
+					PodCIDRs: []string{
+						"172.17.0.0/24",
+						"2001:db8:42:1::/112",
+					},
+				},
+			},
+			"172.17.0.0/24",
+			"2001:db8:42:1::/112",
+			nil,
+		},
+		{
+			"node with node.Annotations['kube-router.io/pod-cidr'] (dual-stack)",
+			"test-node",
+			&apiv1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-node",
+					Annotations: map[string]string{
+						podCIDRAnnotation: "172.17.0.0/24,2001:db8:42:1::/112",
+					},
+				},
+			},
+			"172.17.0.0/24",
+			"2001:db8:42:1::/112",
 			nil,
 		},
 		{
@@ -171,6 +241,7 @@ func Test_GetPodCidrFromNodeSpec(t *testing.T) {
 				},
 			},
 			"",
+			"",
 			errors.New("error parsing pod CIDR in node annotation: invalid CIDR address: 172.17.0.0"),
 		},
 	}
@@ -183,17 +254,46 @@ func Test_GetPodCidrFromNodeSpec(t *testing.T) {
 				t.Fatalf("failed to create existing nodes for test: %v", err)
 			}
 
-			podCIDR, err := GetPodCidrFromNodeSpec(clientset, testcase.hostnameOverride)
+			podCIDRv4, podCIDRv6, err := GetPodCidrsFromNodeSpecByHostname(clientset, testcase.hostnameOverride)
 			if !reflect.DeepEqual(err, testcase.err) {
 				t.Logf("actual error: %v", err)
 				t.Logf("expected error: %v", testcase.err)
 				t.Error("did not get expected error")
 			}
 
-			if podCIDR != testcase.podCIDR {
-				t.Logf("actual podCIDR: %q", podCIDR)
-				t.Logf("expected podCIDR: %q", testcase.podCIDR)
-				t.Error("did not get expected podCIDR")
+			if podCIDRv4 != testcase.podCIDRv4 {
+				t.Logf("actual podCIDRv4: %q", podCIDRv4)
+				t.Logf("expected podCIDRv4: %q", testcase.podCIDRv4)
+				t.Error("did not get expected podCIDRv4")
+			}
+
+			if podCIDRv6 != testcase.podCIDRv6 {
+				t.Logf("actual podCIDRv6: %q", podCIDRv6)
+				t.Logf("expected podCIDRv6: %q", testcase.podCIDRv6)
+				t.Error("did not get expected podCIDRv6")
+			}
+
+			node, err := GetNodeObject(clientset, testcase.hostnameOverride)
+			if err != nil {
+				t.Fatalf("failed to get the node: %v", err)
+			}
+			podCIDRv4, podCIDRv6, err = GetPodCidrsFromNodeSpec(node)
+			if !reflect.DeepEqual(err, testcase.err) {
+				t.Logf("actual error: %v", err)
+				t.Logf("expected error: %v", testcase.err)
+				t.Error("did not get expected error")
+			}
+
+			if podCIDRv4 != testcase.podCIDRv4 {
+				t.Logf("actual podCIDRv4: %q", podCIDRv4)
+				t.Logf("expected podCIDRv4: %q", testcase.podCIDRv4)
+				t.Error("did not get expected podCIDRv4")
+			}
+
+			if podCIDRv6 != testcase.podCIDRv6 {
+				t.Logf("actual podCIDRv6: %q", podCIDRv6)
+				t.Logf("expected podCIDRv6: %q", testcase.podCIDRv6)
+				t.Error("did not get expected podCIDRv6")
 			}
 		})
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"syscall"
 	"time"
 
 	"github.com/moby/ipvs"
@@ -47,13 +48,13 @@ func (lnm *LinuxNetworkingMockImpl) ipvsGetServices() ([]*ipvs.Service, error) {
 	copy(svcsCopy, lnm.ipvsSvcs)
 	return svcsCopy, nil
 }
-func (lnm *LinuxNetworkingMockImpl) ipAddrAdd(iface netlink.Link, addr string, addRouter bool) error {
+func (lnm *LinuxNetworkingMockImpl) ipAddrAdd(iface netlink.Link, addr net.IP, ipFamily uint16, addRouter bool) error {
 	return nil
 }
 func (lnm *LinuxNetworkingMockImpl) ipvsAddServer(ipvsSvc *ipvs.Service, ipvsDst *ipvs.Destination) error {
 	return nil
 }
-func (lnm *LinuxNetworkingMockImpl) ipvsAddService(svcs []*ipvs.Service, vip net.IP, protocol, port uint16, persistent bool, persistentTimeout int32, scheduler string, flags schedFlags) (*ipvs.Service, error) {
+func (lnm *LinuxNetworkingMockImpl) ipvsAddService(svcs []*ipvs.Service, vip net.IP, ipFamily uint16, protocol, port uint16, persistent bool, persistentTimeout int32, scheduler string, flags schedFlags) (*ipvs.Service, error) {
 	svc := &ipvs.Service{
 		Address:  vip,
 		Protocol: protocol,
@@ -143,10 +144,16 @@ var _ = Describe("NetworkServicesController", func() {
 		}
 
 		nsc = &NetworkServicesController{
-			nodeIP:       net.ParseIP("10.0.0.0"),
+			// nodeIPv4:     net.ParseIP("10.0.0.0"),
 			nodeHostName: "node-1",
 			ln:           mockedLinuxNetworking,
 		}
+		nsc.ipFamilyHandlers = make(map[uint16]*ipFamilyHandler)
+		ipv4Handler, err := newIPFamilyHandler(v1core.IPv4Protocol, net.ParseIP("10.0.0.1"), "10.96.0.0/1", localIPsIPSetNamev4, ipvsServicesIPSetNamev4, serviceIPsIPSetNamev4)
+		if err != nil {
+			fatalf("failed to create ip family handler: %v", err)
+		}
+		nsc.ipFamilyHandlers[syscall.AF_INET] = ipv4Handler
 
 		startInformersForServiceProxy(nsc, clientset)
 		waitForListerWithTimeoutG(nsc.svcLister, time.Second*10)
@@ -177,8 +184,8 @@ var _ = Describe("NetworkServicesController", func() {
 		})
 		JustBeforeEach(func() {
 			// pre-inject some foo ipvs Service to verify its deletion
-			fooSvc1, _ = lnm.ipvsAddService(lnm.ipvsSvcs, net.ParseIP("1.2.3.4"), 6, 1234, false, 0, "rr", schedFlags{})
-			fooSvc2, _ = lnm.ipvsAddService(lnm.ipvsSvcs, net.ParseIP("5.6.7.8"), 6, 5678, false, 0, "rr", schedFlags{true, true, false})
+			fooSvc1, _ = lnm.ipvsAddService(lnm.ipvsSvcs, net.ParseIP("1.2.3.4"), syscall.AF_INET, 6, 1234, false, 0, "rr", schedFlags{})
+			fooSvc2, _ = lnm.ipvsAddService(lnm.ipvsSvcs, net.ParseIP("5.6.7.8"), syscall.AF_INET, 6, 5678, false, 0, "rr", schedFlags{true, true, false})
 			syncErr = nsc.syncIpvsServices(nsc.serviceMap, nsc.endpointsMap)
 		})
 		It("Should have called syncIpvsServices OK", func() {
@@ -214,7 +221,7 @@ var _ = Describe("NetworkServicesController", func() {
 			Expect((func() []string {
 				ret := []string{}
 				for _, addr := range mockedLinuxNetworking.ipAddrAddCalls() {
-					ret = append(ret, addr.IP)
+					ret = append(ret, addr.IP.String())
 				}
 				return ret
 			})()).To(
@@ -280,7 +287,7 @@ var _ = Describe("NetworkServicesController", func() {
 			Expect((func() []string {
 				ret := []string{}
 				for _, addr := range mockedLinuxNetworking.ipAddrAddCalls() {
-					ret = append(ret, addr.IP)
+					ret = append(ret, addr.IP.String())
 				}
 				return ret
 			})()).To(
@@ -347,7 +354,7 @@ var _ = Describe("NetworkServicesController", func() {
 			Expect((func() []string {
 				ret := []string{}
 				for _, addr := range mockedLinuxNetworking.ipAddrAddCalls() {
-					ret = append(ret, addr.IP)
+					ret = append(ret, addr.IP.String())
 				}
 				return ret
 			})()).To(
@@ -408,7 +415,7 @@ var _ = Describe("NetworkServicesController", func() {
 			Expect((func() []string {
 				ret := []string{}
 				for _, addr := range mockedLinuxNetworking.ipAddrAddCalls() {
-					ret = append(ret, addr.IP)
+					ret = append(ret, addr.IP.String())
 				}
 				return ret
 			})()).To(

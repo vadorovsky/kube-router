@@ -28,6 +28,7 @@ type gracefulRequest struct {
 func (nsc *NetworkServicesController) ipvsDeleteDestination(svc *ipvs.Service, dst *ipvs.Destination) error {
 	// If we have enabled graceful termination set the weight of the destination to 0
 	// then add it to the queue for graceful termination
+	// ln := nsc.lnHandlers[svc.AddressFamily]
 	if nsc.gracefulTermination {
 		req := gracefulRequest{
 			ipvsSvc:      svc,
@@ -121,6 +122,7 @@ func (nsc *NetworkServicesController) gracefulDeleteIpvsDestination(req graceful
 
 	// Destination has has one or more conditions for deletion
 	if deleteDestination {
+		// ln := nsc.lnHandlers[req.ipvsSvc.AddressFamily]
 		klog.V(2).Infof("Deleting IPVS destination: %s", ipvsDestinationString(req.ipvsDst))
 		if err := nsc.ln.ipvsDelDestination(req.ipvsSvc, req.ipvsDst); err != nil {
 			klog.Errorf("Failed to delete IPVS destination: %s, %s",
@@ -133,6 +135,7 @@ func (nsc *NetworkServicesController) gracefulDeleteIpvsDestination(req graceful
 // getConnStats returns the number of active & inactive connections for the IPVS destination
 func (nsc *NetworkServicesController) getIpvsDestinationConnStats(ipvsSvc *ipvs.Service,
 	dest *ipvs.Destination) (int, int, error) {
+	// ln := nsc.lnHandlers[ipvsSvc.AddressFamily]
 	destStats, err := nsc.ln.ipvsGetDestinations(ipvsSvc)
 	if err != nil {
 		return 0, 0, fmt.Errorf("failed to get IPVS destinations for service : %s : %s",

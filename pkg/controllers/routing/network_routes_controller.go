@@ -13,8 +13,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
+	"github.com/cloudnativelabs/kube-router/pkg/controllers"
 	"github.com/cloudnativelabs/kube-router/pkg/healthcheck"
 	"github.com/cloudnativelabs/kube-router/pkg/metrics"
 	"github.com/cloudnativelabs/kube-router/pkg/options"
@@ -36,10 +38,12 @@ import (
 const (
 	IfaceNotFound = "Link not found"
 
-	customRouteTableID   = "77"
-	customRouteTableName = "kube-router"
-	podSubnetsIPSetName  = "kube-router-pod-subnets"
-	nodeAddrsIPSetName   = "kube-router-node-ips"
+	customRouteTableID      = "77"
+	customRouteTableName    = "kube-router"
+	podSubnetsIPSetNameIPv4 = "kube-router-pod-subnets"
+	podSubnetsIPSetNameIPv6 = "kube-router-pod-subnets-v6"
+	nodeAddrsIPSetNameIPv4  = "kube-router-node-ips"
+	nodeAddrsIPSetNameIPv6  = "kube-router-ndoe-ips-v6"
 
 	nodeASNAnnotation            = "kube-router.io/node.asn"
 	nodeCommunitiesAnnotation    = "kube-router.io/node.bgp.communities"
@@ -73,16 +77,85 @@ const (
 	routeReflectorMaxID     = 32
 	// Taken from: https://github.com/torvalds/linux/blob/master/include/uapi/linux/rtnetlink.h#L284
 	zebraRouteOriginator = 0x11
+
+	ifNameIPv4 = "kube-bridge"
 )
+
+type ipFamilyHandler struct {
+	afi                 gobgpapi.Family_Afi
+	ipSetHandler        *utils.IPSet
+	podSubnetsIPSetName string
+	nodeAddrsIPSetName  string
+	currentPodCidrs     []string
+	currentNodeIP       []string
+
+	*controllers.IPFamilyHandler
+}
+
+func newIPFamilyHandler(family v1core.IPFamily, nodeIP net.IP, podCidr string) (*ipFamilyHandler, error) {
+	var (
+		iptablesCmdHandler  *iptables.IPTables
+		afi                 gobgpapi.Family_Afi
+		ipSetHandler        *utils.IPSet
+		podSubnetsIPSetName string
+		nodeAddrsIPSetName  string
+		err                 error
+	)
+
+	switch family {
+	case v1core.IPv4Protocol:
+		iptablesCmdHandler, err = iptables.NewWithProtocol(iptables.ProtocolIPv4)
+		if err != nil {
+			return nil, err
+		}
+		afi = gobgpapi.Family_AFI_IP
+		ipSetHandler, err = utils.NewIPSet(syscall.AF_INET)
+		if err != nil {
+			return nil, err
+		}
+		podSubnetsIPSetName = podSubnetsIPSetNameIPv4
+		nodeAddrsIPSetName = nodeAddrsIPSetNameIPv4
+	case v1core.IPv6Protocol:
+		iptablesCmdHandler, err = iptables.NewWithProtocol(iptables.ProtocolIPv6)
+		if err != nil {
+			return nil, err
+		}
+		afi = gobgpapi.Family_AFI_IP6
+		ipSetHandler, err = utils.NewIPSet(syscall.AF_INET6)
+		if err != nil {
+			return nil, err
+		}
+		podSubnetsIPSetName = podSubnetsIPSetNameIPv6
+		nodeAddrsIPSetName = nodeAddrsIPSetNameIPv6
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize ip6tables executor: %w", err)
+	}
+
+	handler := &ipFamilyHandler{
+		afi:                 afi,
+		ipSetHandler:        ipSetHandler,
+		podSubnetsIPSetName: podSubnetsIPSetName,
+		nodeAddrsIPSetName:  nodeAddrsIPSetName,
+		IPFamilyHandler: &controllers.IPFamilyHandler{
+			Family:             family,
+			IptablesCmdHandler: iptablesCmdHandler,
+			NodeIP:             nodeIP,
+			PodCidr:            podCidr,
+		},
+	}
+	handler.currentPodCidrs = make([]string, 0)
+	handler.currentNodeIP = make([]string, 0)
+
+	return handler, nil
+}
 
 // NetworkRoutingController is struct to hold necessary information required by controller
 type NetworkRoutingController struct {
-	nodeIP                         net.IP
 	nodeName                       string
 	nodeSubnet                     net.IPNet
 	nodeInterface                  string
 	routerID                       string
-	isIpv6                         bool
 	activeNodes                    map[string]bool
 	mu                             sync.Mutex
 	clientset                      kubernetes.Interface
@@ -107,7 +180,6 @@ type NetworkRoutingController struct {
 	bgpGracefulRestart             bool
 	bgpGracefulRestartTime         time.Duration
 	bgpGracefulRestartDeferralTime time.Duration
-	ipSetHandler                   *utils.IPSet
 	enableOverlays                 bool
 	overlayType                    string
 	peerMultihopTTL                uint8
@@ -127,9 +199,12 @@ type NetworkRoutingController struct {
 	pathPrepend                    bool
 	localAddressList               []string
 	overrideNextHop                bool
-	podCidr                        string
 	CNIFirewallSetup               *sync.Cond
 	ipsetMutex                     *sync.Mutex
+	enableIPv4                     bool
+	enableIPv6                     bool
+
+	ipFamilyHandlers map[uint16]*ipFamilyHandler
 
 	nodeLister cache.Indexer
 	svcLister  cache.Indexer
@@ -139,6 +214,70 @@ type NetworkRoutingController struct {
 	ServiceEventHandler   cache.ResourceEventHandler
 	EndpointsEventHandler cache.ResourceEventHandler
 }
+
+// createInterface creates an interface to which pods will be connected
+func (nrc *NetworkRoutingController) createInterface(ifName string) {
+	kubeBridgeIf, err := netlink.LinkByName(ifName)
+	if err != nil && err.Error() == IfaceNotFound {
+		linkAttrs := netlink.NewLinkAttrs()
+		linkAttrs.Name = ifName
+		bridge := &netlink.Bridge{LinkAttrs: linkAttrs}
+		if err = netlink.LinkAdd(bridge); err != nil {
+			klog.Errorf("Failed to create `kube-router` bridge due to %s. Will be created by CNI bridge "+
+				"plugin when pod is launched.", err.Error())
+		}
+		kubeBridgeIf, err = netlink.LinkByName(ifName)
+		if err != nil {
+			klog.Errorf("Failed to find created `kube-router` bridge due to %s. Will be created by CNI "+
+				"bridge plugin when pod is launched.", err.Error())
+		}
+		err = netlink.LinkSetUp(kubeBridgeIf)
+		if err != nil {
+			klog.Errorf("Failed to bring `kube-router` bridge up due to %s. Will be created by CNI bridge "+
+				"plugin at later point when pod is launched.", err.Error())
+		}
+	}
+
+	if nrc.autoMTU {
+		var mtu int
+		// if nrc.enableIPv4 {
+		for _, ipFamilyHandler := range nrc.ipFamilyHandlers {
+			mtu, err = utils.GetMTUFromNodeIP(ipFamilyHandler.NodeIP, nrc.enableOverlays)
+			if err != nil {
+				klog.Errorf("Failed to find MTU for node IP: %s for intelligently setting the %s MTU "+
+					"due to %s.", ipFamilyHandler.NodeIP, ifName, err.Error())
+			}
+		}
+		if mtu > 0 {
+			klog.Infof("Setting MTU of %s interface to: %d", ifName, mtu)
+			err = netlink.LinkSetMTU(kubeBridgeIf, mtu)
+			if err != nil {
+				klog.Errorf("Failed to set MTU for %s interface due to: %s", ifName, err.Error())
+			}
+		} else {
+			klog.Infof("Not setting MTU of %s interface", ifName)
+		}
+	}
+	// enable netfilter for the bridge
+	if _, err := exec.Command("modprobe", "br_netfilter").CombinedOutput(); err != nil {
+		klog.Errorf("Failed to enable netfilter for bridge. Network policies and service proxy may "+
+			"not work: %s", err.Error())
+	}
+	sysctlErr := utils.SetSysctl(utils.BridgeNFCallIPTables, 1)
+	if sysctlErr != nil && sysctlErr.IsFatal() {
+		klog.Errorf("Failed to enable iptables for bridge. Network policies and service proxy may "+
+			"not work: %s", sysctlErr.Error())
+	}
+}
+
+// func (nrc *NetworkRoutingController) createInterfaceIPv6(ifName string) {
+// 	nrc.createInterface(ifName)
+// 	sysctlErr := utils.SetSysctl(utils.BridgeNFCallIP6Tables, 1)
+// 	if sysctlErr != nil && sysctlErr.IsFatal() {
+// 		klog.Errorf("Failed to enable ip6tables for bridge. Network policies and service proxy may "+
+// 			"not work: %s", sysctlErr.Error())
+// 	}
+// }
 
 // Run runs forever until we are notified on stop channel
 func (nrc *NetworkRoutingController) Run(healthChan chan<- *healthcheck.ControllerHeartbeat, stopCh <-chan struct{},
@@ -208,61 +347,13 @@ func (nrc *NetworkRoutingController) Run(healthChan chan<- *healthcheck.Controll
 		}
 	}
 
-	// create 'kube-bridge' interface to which pods will be connected
-	kubeBridgeIf, err := netlink.LinkByName("kube-bridge")
-	if err != nil && err.Error() == IfaceNotFound {
-		linkAttrs := netlink.NewLinkAttrs()
-		linkAttrs.Name = "kube-bridge"
-		bridge := &netlink.Bridge{LinkAttrs: linkAttrs}
-		if err = netlink.LinkAdd(bridge); err != nil {
-			klog.Errorf("Failed to create `kube-router` bridge due to %s. Will be created by CNI bridge "+
-				"plugin when pod is launched.", err.Error())
-		}
-		kubeBridgeIf, err = netlink.LinkByName("kube-bridge")
-		if err != nil {
-			klog.Errorf("Failed to find created `kube-router` bridge due to %s. Will be created by CNI "+
-				"bridge plugin when pod is launched.", err.Error())
-		}
-		err = netlink.LinkSetUp(kubeBridgeIf)
-		if err != nil {
-			klog.Errorf("Failed to bring `kube-router` bridge up due to %s. Will be created by CNI bridge "+
-				"plugin at later point when pod is launched.", err.Error())
-		}
-	}
-
-	if nrc.autoMTU {
-		mtu, err := utils.GetMTUFromNodeIP(nrc.nodeIP, nrc.enableOverlays)
-		if err != nil {
-			klog.Errorf("Failed to find MTU for node IP: %s for intelligently setting the kube-bridge MTU "+
-				"due to %s.", nrc.nodeIP, err.Error())
-		}
-		if mtu > 0 {
-			klog.Infof("Setting MTU of kube-bridge interface to: %d", mtu)
-			err = netlink.LinkSetMTU(kubeBridgeIf, mtu)
-			if err != nil {
-				klog.Errorf("Failed to set MTU for kube-bridge interface due to: %s", err.Error())
-			}
-		} else {
-			klog.Infof("Not setting MTU of kube-bridge interface")
-		}
-	}
-	// enable netfilter for the bridge
-	if _, err := exec.Command("modprobe", "br_netfilter").CombinedOutput(); err != nil {
-		klog.Errorf("Failed to enable netfilter for bridge. Network policies and service proxy may "+
-			"not work: %s", err.Error())
-	}
-	sysctlErr := utils.SetSysctl(utils.BridgeNFCallIPTables, 1)
-	if sysctlErr != nil {
-		klog.Errorf("Failed to enable iptables for bridge. Network policies and service proxy may "+
-			"not work: %s", sysctlErr.Error())
-	}
-	if nrc.isIpv6 {
-		sysctlErr = utils.SetSysctl(utils.BridgeNFCallIP6Tables, 1)
-		if sysctlErr != nil {
-			klog.Errorf("Failed to enable ip6tables for bridge. Network policies and service proxy may "+
-				"not work: %s", sysctlErr.Error())
-		}
-	}
+	// It's probably fine to use just one interface.
+	// if nrc.enableIPv4 {
+	nrc.createInterface(ifNameIPv4)
+	// }
+	// if nrc.enableIPv6 {
+	//	nrc.createInterfaceIPv6(ifNameIPv6)
+	// }
 
 	t := time.NewTicker(nrc.syncPeriod)
 	defer t.Stop()
@@ -377,7 +468,9 @@ func (nrc *NetworkRoutingController) updateCNIConfig() {
 	cidrlen, _ := cidr.Mask.Size()
 	oldCidr := cidr.IP.String() + "/" + strconv.Itoa(cidrlen)
 
-	currentCidr := nrc.podCidr
+	// OH BOY, that one will be hard to handle... How do we even put dual-stack addresses in that
+	// CNI config? Need to figure out... For now just use ipv4
+	currentCidr := nrc.ipFamilyHandlers[syscall.AF_INET].PodCidr
 
 	if len(cidr.IP) == 0 || strings.Compare(oldCidr, currentCidr) != 0 {
 		err = utils.InsertPodCidrInCniSpec(nrc.cniConfFile, currentCidr)
@@ -395,13 +488,20 @@ func (nrc *NetworkRoutingController) updateCNIConfig() {
 }
 
 func (nrc *NetworkRoutingController) autoConfigureMTU() error {
-	mtu, err := utils.GetMTUFromNodeIP(nrc.nodeIP, nrc.enableOverlays)
-	if err != nil {
-		return fmt.Errorf("failed to generate MTU: %s", err.Error())
+	var (
+		mtu int
+		err error
+	)
+	// if nrc.enableIPv4 {
+	for _, ipFamilyHandler := range nrc.ipFamilyHandlers {
+		mtu, err = utils.GetMTUFromNodeIP(ipFamilyHandler.NodeIP, nrc.enableOverlays)
+		if err != nil {
+			return fmt.Errorf("failed to generate MTU: %w", err)
+		}
 	}
 	file, err := ioutil.ReadFile(nrc.cniConfFile)
 	if err != nil {
-		return fmt.Errorf("failed to load CNI conf file: %s", err.Error())
+		return fmt.Errorf("failed to load CNI conf file: %w", err)
 	}
 	var config interface{}
 	err = json.Unmarshal(file, &config)
@@ -433,27 +533,30 @@ func (nrc *NetworkRoutingController) autoConfigureMTU() error {
 }
 
 func (nrc *NetworkRoutingController) watchBgpUpdates() {
-	pathWatch := func(path *gobgpapi.Path) {
-		if nrc.MetricsEnabled {
-			metrics.ControllerBGPadvertisementsReceived.Inc()
+	// if nrc.enableIPv4 {
+	for _, ipFamilyHandler := range nrc.ipFamilyHandlers {
+		pathWatch := func(path *gobgpapi.Path) {
+			if nrc.MetricsEnabled {
+				metrics.ControllerBGPadvertisementsReceived.Inc()
+			}
+			if path.NeighborIp == "<nil>" {
+				return
+			}
+			klog.V(2).Infof("Processing bgp route advertisement from peer: %s", path.NeighborIp)
+			if err := nrc.injectRoute(path, ipFamilyHandler.NodeIP); err != nil {
+				klog.Errorf("Failed to inject routes due to: " + err.Error())
+			}
 		}
-		if path.NeighborIp == "<nil>" {
-			return
+		err := nrc.bgpServer.MonitorTable(context.Background(), &gobgpapi.MonitorTableRequest{
+			TableType: gobgpapi.TableType_GLOBAL,
+			Family: &gobgpapi.Family{
+				Afi:  ipFamilyHandler.afi,
+				Safi: gobgpapi.Family_SAFI_UNICAST,
+			},
+		}, pathWatch)
+		if err != nil {
+			klog.Errorf("failed to register monitor global routing table callback due to : " + err.Error())
 		}
-		klog.V(2).Infof("Processing bgp route advertisement from peer: %s", path.NeighborIp)
-		if err := nrc.injectRoute(path); err != nil {
-			klog.Errorf("Failed to inject routes due to: " + err.Error())
-		}
-	}
-	err := nrc.bgpServer.MonitorTable(context.Background(), &gobgpapi.MonitorTableRequest{
-		TableType: gobgpapi.TableType_GLOBAL,
-		Family: &gobgpapi.Family{
-			Afi:  gobgpapi.Family_AFI_IP,
-			Safi: gobgpapi.Family_SAFI_UNICAST,
-		},
-	}, pathWatch)
-	if err != nil {
-		klog.Errorf("failed to register monitor global routing table callback due to : " + err.Error())
 	}
 }
 
@@ -462,17 +565,18 @@ func (nrc *NetworkRoutingController) advertisePodRoute() error {
 		metrics.ControllerBGPadvertisementsSent.Inc()
 	}
 
-	cidrStr := strings.Split(nrc.podCidr, "/")
-	subnet := cidrStr[0]
-	cidrLen, err := strconv.Atoi(cidrStr[1])
-	if err != nil || cidrLen < 0 || cidrLen > 32 {
-		return fmt.Errorf("the pod CIDR IP given is not a proper mask: %d", cidrLen)
-	}
-	if nrc.isIpv6 {
-		klog.V(2).Infof("Advertising route: '%s/%d via %s' to peers", subnet, cidrLen, nrc.nodeIP.String())
+	// if nrc.enableIPv6 {
+	for _, ipFamilyHandler := range nrc.ipFamilyHandlers {
+		cidrStr := strings.Split(ipFamilyHandler.PodCidr, "/")
+		subnet := cidrStr[0]
+		cidrLen, err := strconv.Atoi(cidrStr[1])
+		if err != nil || cidrLen < 0 || cidrLen > 32 {
+			return fmt.Errorf("the pod CIDR IP given is not a proper mask: %d", cidrLen)
+		}
+		klog.V(2).Infof("Advertising route: '%s/%d via %s' to peers", subnet, cidrLen, ipFamilyHandler.NodeIP.String())
 
-		v6Family := &gobgpapi.Family{
-			Afi:  gobgpapi.Family_AFI_IP6,
+		family := &gobgpapi.Family{
+			Afi:  ipFamilyHandler.afi,
 			Safi: gobgpapi.Family_SAFI_UNICAST,
 		}
 		nlri, _ := ptypes.MarshalAny(&gobgpapi.IPAddressPrefix{
@@ -482,52 +586,25 @@ func (nrc *NetworkRoutingController) advertisePodRoute() error {
 		a1, _ := ptypes.MarshalAny(&gobgpapi.OriginAttribute{
 			Origin: 0,
 		})
-		v6Attrs, _ := ptypes.MarshalAny(&gobgpapi.MpReachNLRIAttribute{
-			Family:   v6Family,
-			NextHops: []string{nrc.nodeIP.String()},
+		attrs, _ := ptypes.MarshalAny(&gobgpapi.MpReachNLRIAttribute{
+			Family:   family,
+			NextHops: []string{ipFamilyHandler.NodeIP.String()},
 			Nlris:    []*any.Any{nlri},
 		})
-		_, err := nrc.bgpServer.AddPath(context.Background(), &gobgpapi.AddPathRequest{
+		if _, err = nrc.bgpServer.AddPath(context.Background(), &gobgpapi.AddPathRequest{
 			Path: &gobgpapi.Path{
-				Family: v6Family,
+				Family: family,
 				Nlri:   nlri,
-				Pattrs: []*any.Any{a1, v6Attrs},
+				Pattrs: []*any.Any{a1, attrs},
 			},
-		})
-		if err != nil {
-			return fmt.Errorf(err.Error())
-		}
-	} else {
-
-		klog.V(2).Infof("Advertising route: '%s/%d via %s' to peers", subnet, cidrLen, nrc.nodeIP.String())
-		nlri, _ := ptypes.MarshalAny(&gobgpapi.IPAddressPrefix{
-			PrefixLen: uint32(cidrLen),
-			Prefix:    cidrStr[0],
-		})
-
-		a1, _ := ptypes.MarshalAny(&gobgpapi.OriginAttribute{
-			Origin: 0,
-		})
-		a2, _ := ptypes.MarshalAny(&gobgpapi.NextHopAttribute{
-			NextHop: nrc.nodeIP.String(),
-		})
-		attrs := []*any.Any{a1, a2}
-
-		_, err := nrc.bgpServer.AddPath(context.Background(), &gobgpapi.AddPathRequest{
-			Path: &gobgpapi.Path{
-				Family: &gobgpapi.Family{Afi: gobgpapi.Family_AFI_IP, Safi: gobgpapi.Family_SAFI_UNICAST},
-				Nlri:   nlri,
-				Pattrs: attrs,
-			},
-		})
-		if err != nil {
-			return fmt.Errorf(err.Error())
+		}); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-func (nrc *NetworkRoutingController) injectRoute(path *gobgpapi.Path) error {
+func (nrc *NetworkRoutingController) injectRoute(path *gobgpapi.Path, nodeIP net.IP) error {
 	klog.V(2).Infof("injectRoute Path Looks Like: %s", path.String())
 	var route *netlink.Route
 	var link netlink.Link
@@ -580,7 +657,7 @@ func (nrc *NetworkRoutingController) injectRoute(path *gobgpapi.Path) error {
 	// if the user has disabled overlays, don't create tunnels. If we're not creating a tunnel, check to see if there is
 	// any cleanup that needs to happen.
 	if shouldCreateTunnel() {
-		link, err = nrc.setupOverlayTunnel(tunnelName, nextHop)
+		link, err = nrc.setupOverlayTunnel(tunnelName, nodeIP, nextHop)
 		if err != nil {
 			return err
 		}
@@ -595,7 +672,7 @@ func (nrc *NetworkRoutingController) injectRoute(path *gobgpapi.Path) error {
 		// if we setup an overlay tunnel link, then use it for destination routing
 		route = &netlink.Route{
 			LinkIndex: link.Attrs().Index,
-			Src:       nrc.nodeIP,
+			Src:       nodeIP,
 			Dst:       dst,
 			Protocol:  zebraRouteOriginator,
 		}
@@ -653,7 +730,8 @@ func (nrc *NetworkRoutingController) cleanupTunnel(destinationSubnet *net.IPNet,
 }
 
 // setupOverlayTunnel attempts to create an tunnel link and corresponding routes for IPIP based overlay networks
-func (nrc *NetworkRoutingController) setupOverlayTunnel(tunnelName string, nextHop net.IP) (netlink.Link, error) {
+func (nrc *NetworkRoutingController) setupOverlayTunnel(tunnelName string, nodeIP,
+	nextHop net.IP) (netlink.Link, error) {
 	var out []byte
 	link, err := netlink.LinkByName(tunnelName)
 
@@ -661,7 +739,7 @@ func (nrc *NetworkRoutingController) setupOverlayTunnel(tunnelName string, nextH
 	// nothing to do here
 	if err != nil {
 		out, err = exec.Command(
-			"ip", "tunnel", "add", tunnelName, "mode", "ipip", "local", nrc.nodeIP.String(), "remote",
+			"ip", "tunnel", "add", tunnelName, "mode", "ipip", "local", nodeIP.String(), "remote",
 			nextHop.String(), "dev", nrc.nodeInterface).CombinedOutput()
 		if err != nil {
 			return nil, fmt.Errorf("route not injected for the route advertised by the node %s "+
@@ -734,18 +812,17 @@ func (nrc *NetworkRoutingController) Cleanup() {
 			klog.V(1).Infof("Returned ipset mutex lock")
 		}()
 	}
-	ipset, err := utils.NewIPSet(nrc.isIpv6)
-	if err != nil {
-		klog.Errorf("Failed to clean up ipsets: " + err.Error())
-		return
-	}
-	err = ipset.Save()
-	if err != nil {
-		klog.Errorf("Failed to clean up ipsets: " + err.Error())
-	}
-	err = ipset.DestroyAllWithin()
-	if err != nil {
-		klog.Warningf("Error deleting ipset: %s", err.Error())
+	// if nrc.enableIPv4 {
+	for ipFamily := range nrc.ipFamilyHandlers {
+		ipset, err := utils.NewIPSet(ipFamily)
+		if err != nil {
+			klog.Errorf("Failed to clean up ipsets: " + err.Error())
+			return
+		}
+		if err := ipset.Cleanup(); err != nil {
+			klog.Errorf("Failed to clean up ipsets: " + err.Error())
+			return
+		}
 	}
 
 	klog.Infof("Successfully cleaned the NetworkRoutesController configuration done by kube-router")
@@ -770,118 +847,142 @@ func (nrc *NetworkRoutingController) syncNodeIPSets() error {
 	nodes := nrc.nodeLister.List()
 
 	// Collect active PodCIDR(s) and NodeIPs from nodes
-	currentPodCidrs := make([]string, 0)
-	currentNodeIPs := make([]string, 0)
+	// currentPodCidrsIPv4 := make([]string, 0)
+	// currentPodCidrsIPv6 := make([]string, 0)
+	// currentNodeIPv4 := make([]string, 0)
+	// currentNodeIPv6 := make([]string, 0)
 	for _, obj := range nodes {
 		node := obj.(*v1core.Node)
-		podCIDR := node.GetAnnotations()["kube-router.io/pod-cidr"]
-		if podCIDR == "" {
-			podCIDR = node.Spec.PodCIDR
-		}
-		if podCIDR == "" {
-			klog.Warningf("Couldn't determine PodCIDR of the %v node", node.Name)
+		podCidrv4, podCidrv6, err := utils.GetPodCidrsFromNodeSpec(node)
+		if err != nil {
+			klog.Errorf("Failed to find the pod CIDR for the node: %w", err)
 			continue
 		}
-		currentPodCidrs = append(currentPodCidrs, podCIDR)
-		nodeIP, err := utils.GetNodeIP(node)
+		if podCidrv4 != "" {
+			nrc.ipFamilyHandlers[syscall.AF_INET].currentPodCidrs =
+				append(nrc.ipFamilyHandlers[syscall.AF_INET].currentPodCidrs, podCidrv4)
+		}
+		if podCidrv6 != "" {
+			nrc.ipFamilyHandlers[syscall.AF_INET6].currentPodCidrs =
+				append(nrc.ipFamilyHandlers[syscall.AF_INET6].currentPodCidrs, podCidrv6)
+		}
+		nodeIPv4, nodeIPv6, err := utils.GetNodeIP(node, nrc.enableIPv4, nrc.enableIPv6)
 		if err != nil {
 			klog.Errorf("Failed to find a node IP, cannot add to node ipset which could affect routing: %v", err)
 			continue
 		}
-		currentNodeIPs = append(currentNodeIPs, nodeIP.String())
+		if nodeIPv4 != nil {
+			nrc.ipFamilyHandlers[syscall.AF_INET].currentNodeIP =
+				append(nrc.ipFamilyHandlers[syscall.AF_INET].currentNodeIP, nodeIPv4.String())
+		}
+		if nodeIPv6 != nil {
+			nrc.ipFamilyHandlers[syscall.AF_INET6].currentNodeIP =
+				append(nrc.ipFamilyHandlers[syscall.AF_INET6].currentNodeIP, nodeIPv6.String())
+		}
 	}
 
-	// Syncing Pod subnet ipset entries
-	psSet := nrc.ipSetHandler.Get(podSubnetsIPSetName)
-	if psSet == nil {
-		klog.Infof("Creating missing ipset \"%s\"", podSubnetsIPSetName)
-		_, err = nrc.ipSetHandler.Create(podSubnetsIPSetName, utils.OptionTimeout, "0")
+	// if nrc.enableIPv4 {
+	for _, ipFamilyHandler := range nrc.ipFamilyHandlers {
+		// Syncing Pod subnet ipset entries
+		psSet := ipFamilyHandler.ipSetHandler.Get(podSubnetsIPSetNameIPv4)
+		if psSet == nil {
+			klog.Infof("Creating missing ipset \"%s\"", podSubnetsIPSetNameIPv4)
+			_, err = ipFamilyHandler.ipSetHandler.Create(podSubnetsIPSetNameIPv4, utils.OptionTimeout, "0")
+			if err != nil {
+				return fmt.Errorf("ipset \"%s\" not found in controller instance",
+					ipFamilyHandler.podSubnetsIPSetName)
+			}
+			psSet = ipFamilyHandler.ipSetHandler.Get(ipFamilyHandler.podSubnetsIPSetName)
+			if nil == psSet {
+				return fmt.Errorf("failed to get ipsethandler for ipset \"%s\"", podSubnetsIPSetNameIPv4)
+			}
+		}
+		err = psSet.Refresh(ipFamilyHandler.currentPodCidrs)
 		if err != nil {
-			return fmt.Errorf("ipset \"%s\" not found in controller instance",
-				podSubnetsIPSetName)
+			return fmt.Errorf("failed to sync Pod Subnets ipset: %w", err)
 		}
-		psSet = nrc.ipSetHandler.Get(podSubnetsIPSetName)
-		if nil == psSet {
-			return fmt.Errorf("failed to get ipsethandler for ipset \"%s\"", podSubnetsIPSetName)
-		}
-	}
-	err = psSet.Refresh(currentPodCidrs)
-	if err != nil {
-		return fmt.Errorf("failed to sync Pod Subnets ipset: %s", err)
-	}
 
-	// Syncing Node Addresses ipset entries
-	naSet := nrc.ipSetHandler.Get(nodeAddrsIPSetName)
-	if naSet == nil {
-		klog.Infof("Creating missing ipset \"%s\"", nodeAddrsIPSetName)
-		_, err = nrc.ipSetHandler.Create(nodeAddrsIPSetName, utils.OptionTimeout, "0")
+		// Syncing Node Addresses ipset entries
+		naSet := ipFamilyHandler.ipSetHandler.Get(ipFamilyHandler.nodeAddrsIPSetName)
+		if naSet == nil {
+			klog.Infof("Creating missing ipset \"%s\"", ipFamilyHandler.nodeAddrsIPSetName)
+			_, err = ipFamilyHandler.ipSetHandler.Create(ipFamilyHandler.nodeAddrsIPSetName, utils.OptionTimeout, "0")
+			if err != nil {
+				return fmt.Errorf("ipset \"%s\" not found in controller instance",
+					ipFamilyHandler.nodeAddrsIPSetName)
+			}
+			naSet = ipFamilyHandler.ipSetHandler.Get(ipFamilyHandler.nodeAddrsIPSetName)
+			if nil == naSet {
+				return fmt.Errorf("failed to get ipsethandler for ipset \"%s\"", ipFamilyHandler.nodeAddrsIPSetName)
+			}
+		}
+		err = naSet.Refresh(ipFamilyHandler.currentNodeIP)
 		if err != nil {
-			return fmt.Errorf("ipset \"%s\" not found in controller instance",
-				nodeAddrsIPSetName)
+			return fmt.Errorf("failed to sync Node Addresses ipset: %w", err)
 		}
-		naSet = nrc.ipSetHandler.Get(nodeAddrsIPSetName)
-		if nil == naSet {
-			return fmt.Errorf("failed to get ipsethandler for ipset \"%s\"", nodeAddrsIPSetName)
-		}
-	}
-	err = naSet.Refresh(currentNodeIPs)
-	if err != nil {
-		return fmt.Errorf("failed to sync Node Addresses ipset: %s", err)
 	}
 
 	return nil
-}
-
-func (nrc *NetworkRoutingController) newIptablesCmdHandler() (*iptables.IPTables, error) {
-	if nrc.isIpv6 {
-		return iptables.NewWithProtocol(iptables.ProtocolIPv6)
-	}
-	return iptables.NewWithProtocol(iptables.ProtocolIPv4)
 }
 
 // ensure there is rule in filter table and FORWARD chain to permit in/out traffic from pods
 // this rules will be appended so that any iptables rules for network policies will take
 // precedence
 func (nrc *NetworkRoutingController) enableForwarding() error {
-
-	iptablesCmdHandler, _ := nrc.newIptablesCmdHandler()
-
-	comment := "allow outbound traffic from pods"
-	args := []string{"-m", "comment", "--comment", comment, "-i", "kube-bridge", "-j", "ACCEPT"}
-	exists, err := iptablesCmdHandler.Exists("filter", "FORWARD", args...)
-	if err != nil {
-		return fmt.Errorf("failed to run iptables command: %s", err.Error())
+	iptablesCmdHandlers := make([]*iptables.IPTables, 0, 2)
+	if nrc.enableIPv4 {
+		iptablesCmdHandler, err := iptables.NewWithProtocol(iptables.ProtocolIPv4)
+		if err != nil {
+			return fmt.Errorf("failed to create iptables handler: %w", err)
+		}
+		iptablesCmdHandlers = append(iptablesCmdHandlers, iptablesCmdHandler)
 	}
-	if !exists {
-		err := iptablesCmdHandler.Insert("filter", "FORWARD", 1, args...)
+	if nrc.enableIPv6 {
+		ip6tablesCmdHandler, err := iptables.NewWithProtocol(iptables.ProtocolIPv6)
+		if err != nil {
+			return fmt.Errorf("failed to create ip6tables handler: %w", err)
+		}
+		iptablesCmdHandlers = append(iptablesCmdHandlers, ip6tablesCmdHandler)
+	}
+
+	for _, iptablesCmdHandler := range iptablesCmdHandlers {
+		comment := "allow outbound traffic from pods"
+		args := []string{"-m", "comment", "--comment", comment, "-i", "kube-bridge", "-j", "ACCEPT"}
+		exists, err := iptablesCmdHandler.Exists("filter", "FORWARD", args...)
 		if err != nil {
 			return fmt.Errorf("failed to run iptables command: %s", err.Error())
 		}
-	}
+		if !exists {
+			err := iptablesCmdHandler.Insert("filter", "FORWARD", 1, args...)
+			if err != nil {
+				return fmt.Errorf("failed to run iptables command: %s", err.Error())
+			}
+		}
 
-	comment = "allow inbound traffic to pods"
-	args = []string{"-m", "comment", "--comment", comment, "-o", "kube-bridge", "-j", "ACCEPT"}
-	exists, err = iptablesCmdHandler.Exists("filter", "FORWARD", args...)
-	if err != nil {
-		return fmt.Errorf("failed to run iptables command: %s", err.Error())
-	}
-	if !exists {
-		err = iptablesCmdHandler.Insert("filter", "FORWARD", 1, args...)
+		comment = "allow inbound traffic to pods"
+		args = []string{"-m", "comment", "--comment", comment, "-o", "kube-bridge", "-j", "ACCEPT"}
+		exists, err = iptablesCmdHandler.Exists("filter", "FORWARD", args...)
 		if err != nil {
 			return fmt.Errorf("failed to run iptables command: %s", err.Error())
 		}
-	}
+		if !exists {
+			err = iptablesCmdHandler.Insert("filter", "FORWARD", 1, args...)
+			if err != nil {
+				return fmt.Errorf("failed to run iptables command: %s", err.Error())
+			}
+		}
 
-	comment = "allow outbound node port traffic on node interface with which node ip is associated"
-	args = []string{"-m", "comment", "--comment", comment, "-o", nrc.nodeInterface, "-j", "ACCEPT"}
-	exists, err = iptablesCmdHandler.Exists("filter", "FORWARD", args...)
-	if err != nil {
-		return fmt.Errorf("failed to run iptables command: %s", err.Error())
-	}
-	if !exists {
-		err = iptablesCmdHandler.Insert("filter", "FORWARD", 1, args...)
+		comment = "allow outbound node port traffic on node interface with which node ip is associated"
+		args = []string{"-m", "comment", "--comment", comment, "-o", nrc.nodeInterface, "-j", "ACCEPT"}
+		exists, err = iptablesCmdHandler.Exists("filter", "FORWARD", args...)
 		if err != nil {
 			return fmt.Errorf("failed to run iptables command: %s", err.Error())
+		}
+		if !exists {
+			err = iptablesCmdHandler.Insert("filter", "FORWARD", 1, args...)
+			if err != nil {
+				return fmt.Errorf("failed to run iptables command: %s", err.Error())
+			}
 		}
 	}
 
@@ -979,8 +1080,19 @@ func (nrc *NetworkRoutingController) startBgpServer(grpcServer bool) error {
 	}
 
 	if grpcServer {
-		nrc.bgpServer = gobgp.NewBgpServer(
-			gobgp.GrpcListenAddress(nrc.nodeIP.String() + ":50051" + "," + "127.0.0.1:50051"))
+		uri := ""
+		for ipFamily, ipFamilyHandler := range nrc.ipFamilyHandlers {
+			var uriFmt string
+			switch ipFamily {
+			case syscall.AF_INET:
+				uriFmt = "%s:50051,127.0.0.1:50051,"
+			case syscall.AF_INET6:
+				uriFmt = "[%s]:50051,[::1]:50051,"
+			}
+			uri += fmt.Sprintf(uriFmt, ipFamilyHandler.NodeIP.String())
+		}
+		nrc.bgpServer = gobgp.NewBgpServer(gobgp.GrpcListenAddress(uri))
+
 	} else {
 		nrc.bgpServer = gobgp.NewBgpServer()
 	}
@@ -1166,20 +1278,47 @@ func NewNetworkRoutingController(clientset kubernetes.Interface,
 
 	nrc.nodeName = node.Name
 
-	nodeIP, err := utils.GetNodeIP(node)
+	nodeIPv4, nodeIPv6, err := utils.GetNodeIP(node, nrc.enableIPv4, nrc.enableIPv6)
 	if err != nil {
 		return nil, errors.New("failed getting IP address from node object: " + err.Error())
 	}
-	nrc.nodeIP = nodeIP
-	nrc.isIpv6 = nodeIP.To4() == nil
+	cidrv4, cidrv6, err := utils.GetPodCidrsFromNodeSpecByHostname(clientset, nrc.hostnameOverride)
+	if err != nil {
+		klog.Fatalf("Failed to get pod CIDR from node spec. kube-router relies on kube-controller-manager to "+
+			"allocate pod CIDR for the node or an annotation `kube-router.io/pod-cidr`. Error: %v", err)
+		return nil, fmt.Errorf("failed to get pod CIDR details from Node.spec: %w", err)
+	}
+	nrc.ipFamilyHandlers = make(map[uint16]*ipFamilyHandler)
+	if nrc.enableIPv4 {
+		ipv4Handler, err := newIPFamilyHandler(v1core.IPv4Protocol, nodeIPv4, cidrv4)
+		if err != nil {
+			return nil, err
+		}
+		nrc.ipFamilyHandlers[syscall.AF_INET] = ipv4Handler
+	}
+	if nrc.enableIPv6 {
+		ipv6Handler, err := newIPFamilyHandler(v1core.IPv6Protocol, nodeIPv6, cidrv6)
+		if err != nil {
+			return nil, err
+		}
+		nrc.ipFamilyHandlers[syscall.AF_INET6] = ipv6Handler
+	}
+	// nrc.podCidrv4 = cidrv4
+	// nrc.podCidrv6 = cidrv6
+	// if nodeIPv4 != nil {
+	// 	nrc.nodeIPv4 = nodeIPv4
+	// }
+	// if nodeIPv6 != nil {
+	// 	nrc.nodeIPv6 = nodeIPv6
+	// }
 
 	if kubeRouterConfig.RouterID != "" {
 		nrc.routerID = kubeRouterConfig.RouterID
 	} else {
-		if nrc.isIpv6 {
+		if nrc.enableIPv6 {
 			return nil, errors.New("router-id must be specified in ipv6 operation")
 		}
-		nrc.routerID = nrc.nodeIP.String()
+		nrc.routerID = nrc.ipFamilyHandlers[syscall.AF_INET].NodeIP.String()
 	}
 
 	// lets start with assumption we hace necessary IAM creds to access EC2 api
@@ -1195,27 +1334,28 @@ func NewNetworkRoutingController(clientset kubernetes.Interface,
 		}
 	}
 
-	cidr, err := utils.GetPodCidrFromNodeSpec(clientset, nrc.hostnameOverride)
-	if err != nil {
-		klog.Fatalf("Failed to get pod CIDR from node spec. kube-router relies on kube-controller-manager to "+
-			"allocate pod CIDR for the node or an annotation `kube-router.io/pod-cidr`. Error: %v", err)
-		return nil, fmt.Errorf("failed to get pod CIDR details from Node.spec: %s", err.Error())
-	}
-	nrc.podCidr = cidr
+	// cidrv4, cidrv6, err := utils.GetPodCidrsFromNodeSpecByHostname(clientset, nrc.hostnameOverride)
+	// if err != nil {
+	// 	klog.Fatalf("Failed to get pod CIDR from node spec. kube-router relies on kube-controller-manager to "+
+	// 		"allocate pod CIDR for the node or an annotation `kube-router.io/pod-cidr`. Error: %v", err)
+	// 	return nil, fmt.Errorf("failed to get pod CIDR details from Node.spec: %w", err)
+	// }
+	// nrc.podCidrv4 = cidrv4
+	// nrc.podCidrv6 = cidrv6
 
-	nrc.ipSetHandler, err = utils.NewIPSet(nrc.isIpv6)
-	if err != nil {
-		return nil, err
-	}
+	// if nrc.enableIPv4 {
+	for _, ipFamilyHandler := range nrc.ipFamilyHandlers {
+		_, err = ipFamilyHandler.ipSetHandler.Create(ipFamilyHandler.podSubnetsIPSetName,
+			utils.TypeHashNet, utils.OptionTimeout, "0")
+		if err != nil {
+			return nil, err
+		}
 
-	_, err = nrc.ipSetHandler.Create(podSubnetsIPSetName, utils.TypeHashNet, utils.OptionTimeout, "0")
-	if err != nil {
-		return nil, err
-	}
-
-	_, err = nrc.ipSetHandler.Create(nodeAddrsIPSetName, utils.TypeHashIP, utils.OptionTimeout, "0")
-	if err != nil {
-		return nil, err
+		_, err = ipFamilyHandler.ipSetHandler.Create(ipFamilyHandler.nodeAddrsIPSetName,
+			utils.TypeHashIP, utils.OptionTimeout, "0")
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	if kubeRouterConfig.EnablePodEgress || len(nrc.clusterCIDR) != 0 {
@@ -1242,6 +1382,9 @@ func NewNetworkRoutingController(clientset kubernetes.Interface,
 	nrc.CNIFirewallSetup = sync.NewCond(&sync.Mutex{})
 
 	nrc.bgpPort = kubeRouterConfig.BGPPort
+
+	nrc.enableIPv4 = kubeRouterConfig.EnableIPv4
+	nrc.enableIPv6 = kubeRouterConfig.EnableIPv6
 
 	// Convert ints to uint32s
 	peerASNs := make([]uint32, 0)
@@ -1281,7 +1424,7 @@ func NewNetworkRoutingController(clientset kubernetes.Interface,
 		return nil, fmt.Errorf("error processing Global Peer Router configs: %s", err)
 	}
 
-	nrc.nodeSubnet, nrc.nodeInterface, err = getNodeSubnet(nodeIP)
+	nrc.nodeSubnet, nrc.nodeInterface, err = getNodeSubnet(nodeIPv4, nodeIPv6, nrc.enableIPv4, nrc.enableIPv6)
 	if err != nil {
 		return nil, errors.New("failed find the subnet of the node IP and interface on" +
 			"which its configured: " + err.Error())
@@ -1289,9 +1432,12 @@ func NewNetworkRoutingController(clientset kubernetes.Interface,
 
 	bgpLocalAddressListAnnotation, ok := node.ObjectMeta.Annotations[bgpLocalAddressAnnotation]
 	if !ok {
-		klog.Infof("Could not find annotation `kube-router.io/bgp-local-addresses` on node object so BGP "+
-			"will listen on node IP: %s address.", nrc.nodeIP.String())
-		nrc.localAddressList = append(nrc.localAddressList, nrc.nodeIP.String())
+		// if nrc.enableIPv4 {
+		for _, ipFamilyHandler := range nrc.ipFamilyHandlers {
+			klog.Infof("Could not find annotation `kube-router.io/bgp-local-addresses` on node object so BGP "+
+				"will listen on node IP: %s address.", ipFamilyHandler.NodeIP.String())
+			nrc.localAddressList = append(nrc.localAddressList, ipFamilyHandler.NodeIP.String())
+		}
 	} else {
 		klog.Infof("Found annotation `kube-router.io/bgp-local-addresses` on node object so BGP will listen "+
 			"on local IP's: %s", bgpLocalAddressListAnnotation)

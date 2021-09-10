@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"net"
 	"strings"
 	"sync"
 	"testing"
@@ -193,7 +192,7 @@ func newUneventfulNetworkPolicyController(podInformer cache.SharedIndexInformer,
 	npc.syncPeriod = time.Hour
 
 	npc.nodeHostName = "node"
-	npc.nodeIP = net.IPv4(10, 10, 10, 10)
+	// npc.nodeIPv4 = net.IPv4(10, 10, 10, 10)
 	npc.podLister = podInformer.GetIndexer()
 	npc.nsLister = nsInformer.GetIndexer()
 	npc.npLister = npInformer.GetIndexer()
@@ -608,6 +607,18 @@ func TestNetworkPolicyController(t *testing.T) {
 			"failed to get parse --service-cluster-ip-range parameter: invalid CIDR address: 10.10.10.10",
 		},
 		{
+			"Test bad cluster CIDRs (using more than 2 ip addresses, including 2 ipv4)",
+			newMinimalKubeRouterConfig("10.96.0.0/12,10.244.0.0/16,2001:db8:42:1::/112", "", "node", nil),
+			true,
+			"too many CIDRs provided in --service-cluster-ip-range parameter, only two addresses are allowed at once for dual-stack",
+		},
+		{
+			"Test bad cluster CIDRs (using more than 2 ip addresses, including 2 ipv6)",
+			newMinimalKubeRouterConfig("10.96.0.0/12,2001:db8:42:0::/56,2001:db8:42:1::/112", "", "node", nil),
+			true,
+			"too many CIDRs provided in --service-cluster-ip-range parameter, only two addresses are allowed at once for dual-stack",
+		},
+		{
 			"Test good cluster CIDR (using single IP with a /32)",
 			newMinimalKubeRouterConfig("10.10.10.10/32", "", "node", nil),
 			false,
@@ -616,6 +627,18 @@ func TestNetworkPolicyController(t *testing.T) {
 		{
 			"Test good cluster CIDR (using normal range with /24)",
 			newMinimalKubeRouterConfig("10.10.10.0/24", "", "node", nil),
+			false,
+			"",
+		},
+		{
+			"Test good cluster CIDR (using ipv6)",
+			newMinimalKubeRouterConfig("2001:db8:42:1::/112", "", "node", nil),
+			false,
+			"",
+		},
+		{
+			"Test good cluster CIDRs (with dual-stack)",
+			newMinimalKubeRouterConfig("10.96.0.0/12,2001:db8:42:1::/112", "", "node", nil),
 			false,
 			"",
 		},

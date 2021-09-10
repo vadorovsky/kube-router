@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"syscall"
 
 	"github.com/cloudnativelabs/kube-router/pkg/utils"
 
@@ -20,59 +21,68 @@ import (
 
 // bgpAdvertiseVIP advertises the service vip (cluster ip or load balancer ip or external IP) the configured peers
 func (nrc *NetworkRoutingController) bgpAdvertiseVIP(vip string) error {
+	// if nrc.enableIPv4 {
+	for _, ipFamilyHandler := range nrc.ipFamilyHandlers {
+		klog.V(2).Infof("Advertising route: '%s/%s via %s' to peers",
+			vip, strconv.Itoa(32), ipFamilyHandler.NodeIP.String())
 
-	klog.V(2).Infof("Advertising route: '%s/%s via %s' to peers",
-		vip, strconv.Itoa(32), nrc.nodeIP.String())
+		a1, _ := ptypes.MarshalAny(&gobgpapi.OriginAttribute{
+			Origin: 0,
+		})
+		a2, _ := ptypes.MarshalAny(&gobgpapi.NextHopAttribute{
+			NextHop: ipFamilyHandler.NodeIP.String(),
+		})
+		attrs := []*any.Any{a1, a2}
+		nlri1, _ := ptypes.MarshalAny(&gobgpapi.IPAddressPrefix{
+			Prefix:    vip,
+			PrefixLen: 32,
+		})
+		if _, err := nrc.bgpServer.AddPath(context.Background(), &gobgpapi.AddPathRequest{
+			Path: &gobgpapi.Path{
+				Family: &gobgpapi.Family{Afi: ipFamilyHandler.afi, Safi: gobgpapi.Family_SAFI_UNICAST},
+				Nlri:   nlri1,
+				Pattrs: attrs,
+			},
+		}); err != nil {
+			return err
+		}
+	}
 
-	a1, _ := ptypes.MarshalAny(&gobgpapi.OriginAttribute{
-		Origin: 0,
-	})
-	a2, _ := ptypes.MarshalAny(&gobgpapi.NextHopAttribute{
-		NextHop: nrc.nodeIP.String(),
-	})
-	attrs := []*any.Any{a1, a2}
-	nlri1, _ := ptypes.MarshalAny(&gobgpapi.IPAddressPrefix{
-		Prefix:    vip,
-		PrefixLen: 32,
-	})
-	_, err := nrc.bgpServer.AddPath(context.Background(), &gobgpapi.AddPathRequest{
-		Path: &gobgpapi.Path{
-			Family: &gobgpapi.Family{Afi: gobgpapi.Family_AFI_IP, Safi: gobgpapi.Family_SAFI_UNICAST},
-			Nlri:   nlri1,
-			Pattrs: attrs,
-		},
-	})
-
-	return err
+	return nil
 }
 
 // bgpWithdrawVIP  unadvertises the service vip
 func (nrc *NetworkRoutingController) bgpWithdrawVIP(vip string) error {
-	klog.V(2).Infof("Withdrawing route: '%s/%s via %s' to peers",
-		vip, strconv.Itoa(32), nrc.nodeIP.String())
+	// if nrc.enableIPv4 {
+	for _, ipFamilyHandler := range nrc.ipFamilyHandlers {
+		klog.V(2).Infof("Withdrawing route: '%s/%s via %s' to peers",
+			vip, strconv.Itoa(32), ipFamilyHandler.NodeIP.String())
 
-	a1, _ := ptypes.MarshalAny(&gobgpapi.OriginAttribute{
-		Origin: 0,
-	})
-	a2, _ := ptypes.MarshalAny(&gobgpapi.NextHopAttribute{
-		NextHop: nrc.nodeIP.String(),
-	})
-	attrs := []*any.Any{a1, a2}
-	nlri, _ := ptypes.MarshalAny(&gobgpapi.IPAddressPrefix{
-		Prefix:    vip,
-		PrefixLen: 32,
-	})
-	path := gobgpapi.Path{
-		Family: &gobgpapi.Family{Afi: gobgpapi.Family_AFI_IP, Safi: gobgpapi.Family_SAFI_UNICAST},
-		Nlri:   nlri,
-		Pattrs: attrs,
+		a1, _ := ptypes.MarshalAny(&gobgpapi.OriginAttribute{
+			Origin: 0,
+		})
+		a2, _ := ptypes.MarshalAny(&gobgpapi.NextHopAttribute{
+			NextHop: ipFamilyHandler.NodeIP.String(),
+		})
+		attrs := []*any.Any{a1, a2}
+		nlri, _ := ptypes.MarshalAny(&gobgpapi.IPAddressPrefix{
+			Prefix:    vip,
+			PrefixLen: 32,
+		})
+		path := gobgpapi.Path{
+			Family: &gobgpapi.Family{Afi: ipFamilyHandler.afi, Safi: gobgpapi.Family_SAFI_UNICAST},
+			Nlri:   nlri,
+			Pattrs: attrs,
+		}
+		if err := nrc.bgpServer.DeletePath(context.Background(), &gobgpapi.DeletePathRequest{
+			TableType: gobgpapi.TableType_GLOBAL,
+			Path:      &path,
+		}); err != nil {
+			return err
+		}
 	}
-	err := nrc.bgpServer.DeletePath(context.Background(), &gobgpapi.DeletePathRequest{
-		TableType: gobgpapi.TableType_GLOBAL,
-		Path:      &path,
-	})
 
-	return err
+	return nil
 }
 
 func (nrc *NetworkRoutingController) advertiseVIPs(vips []string) {
@@ -521,7 +531,10 @@ func (nrc *NetworkRoutingController) nodeHasEndpointsForService(svc *v1core.Serv
 					return true, nil
 				}
 			} else {
-				if address.IP == nrc.nodeIP.String() {
+				if nrc.enableIPv4 && address.IP == nrc.ipFamilyHandlers[syscall.AF_INET].NodeIP.String() {
+					return true, nil
+				}
+				if nrc.enableIPv6 && address.IP == nrc.ipFamilyHandlers[syscall.AF_INET6].NodeIP.String() {
 					return true, nil
 				}
 			}

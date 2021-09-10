@@ -2,6 +2,8 @@ package utils
 
 import (
 	"bytes"
+	"syscall"
+
 	// nolint:gosec // we don't use this hash in a sensitive capacity, so we don't care that its weak
 	"crypto/sha1"
 	"encoding/base32"
@@ -154,7 +156,7 @@ const (
 type IPSet struct {
 	ipSetPath *string
 	Sets      map[string]*Set
-	isIpv6    bool
+	ipFamily  uint16
 }
 
 // Set represent a ipset set entry.
@@ -218,7 +220,7 @@ func (ipset *IPSet) runWithStdin(stdin *bytes.Buffer, args ...string) error {
 }
 
 // NewIPSet create a new IPSet with ipSetPath initialized.
-func NewIPSet(isIpv6 bool) (*IPSet, error) {
+func NewIPSet(ipFamily uint16) (*IPSet, error) {
 	ipSetPath, err := getIPSetPath()
 	if err != nil {
 		return nil, err
@@ -226,7 +228,7 @@ func NewIPSet(isIpv6 bool) (*IPSet, error) {
 	ipSet := &IPSet{
 		ipSetPath: ipSetPath,
 		Sets:      make(map[string]*Set),
-		isIpv6:    isIpv6,
+		ipFamily:  ipFamily,
 	}
 	return ipSet, nil
 }
@@ -247,25 +249,26 @@ func (ipset *IPSet) Create(setName string, createOptions ...string) (*Set, error
 	// Determine if set with the same name is already active on the system
 	setIsActive, err := ipset.Sets[setName].IsActive()
 	if err != nil {
-		return nil, fmt.Errorf("failed to determine if ipset set %s exists: %s",
+		return nil, fmt.Errorf("failed to determine if ipset set %s exists: %w",
 			setName, err)
 	}
 
 	// Create set if missing from the system
 	if !setIsActive {
-		if ipset.isIpv6 {
+		switch ipset.ipFamily {
+		case syscall.AF_INET6:
 			// Add "family inet6" option and a "inet6:" prefix for IPv6 sets.
 			args := []string{"create", "-exist", ipset.Sets[setName].name()}
 			args = append(args, createOptions...)
 			args = append(args, "family", "inet6")
 			if _, err := ipset.run(args...); err != nil {
-				return nil, fmt.Errorf("failed to create ipset set on system: %s", err)
+				return nil, fmt.Errorf("failed to create ipset set on system: %w", err)
 			}
-		} else {
+		case syscall.AF_INET:
 			_, err := ipset.run(append([]string{"create", "-exist", setName},
 				createOptions...)...)
 			if err != nil {
-				return nil, fmt.Errorf("failed to create ipset set on system: %s", err)
+				return nil, fmt.Errorf("failed to create ipset set on system: %w", err)
 			}
 		}
 	}
@@ -306,6 +309,13 @@ func (ipset *IPSet) RefreshSet(setName string, entriesWithOptions [][]string, se
 		entries[i] = &Entry{Set: ipset.Sets[setName], Options: entry}
 	}
 	ipset.Get(setName).Entries = entries
+}
+
+func (ipset *IPSet) Cleanup() error {
+	if err := ipset.Save(); err != nil {
+		return err
+	}
+	return ipset.DestroyAllWithin()
 }
 
 // Add a given entry to the set. If the -exist option is specified, ipset
@@ -432,10 +442,12 @@ func (set *Set) IsActive() (bool, error) {
 }
 
 func (set *Set) name() string {
-	if set.Parent.isIpv6 {
+	switch set.Parent.ipFamily {
+	case syscall.AF_INET6:
 		return "inet6:" + set.Name
+	default:
+		return set.Name
 	}
-	return set.Name
 }
 
 // Parse ipset save stdout.
@@ -585,7 +597,7 @@ func (ipset *IPSet) Get(setName string) *Set {
 
 // Rename a set. Set identified by SETNAME-TO must not exist.
 func (set *Set) Rename(newName string) error {
-	if set.Parent.isIpv6 {
+	if set.Parent.ipFamily == syscall.AF_INET6 {
 		newName = "ipv6:" + newName
 	}
 	_, err := set.Parent.run("rename", set.name(), newName)

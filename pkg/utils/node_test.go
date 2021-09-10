@@ -95,13 +95,16 @@ func Test_GetNodeObject(t *testing.T) {
 
 func Test_GetNodeIP(t *testing.T) {
 	testcases := []struct {
-		name string
-		node *apiv1.Node
-		ip   net.IP
-		err  error
+		name       string
+		node       *apiv1.Node
+		enableIPv4 bool
+		enableIPv6 bool
+		ipv4       net.IP
+		ipv6       net.IP
+		err        error
 	}{
 		{
-			"has external and internal IPs",
+			"has external and internal IPs (IPv4)",
 			&apiv1.Node{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "test-node",
@@ -119,11 +122,14 @@ func Test_GetNodeIP(t *testing.T) {
 					},
 				},
 			},
+			true,
+			false,
 			net.ParseIP("10.0.0.1"),
+			nil,
 			nil,
 		},
 		{
-			"has only internal IP",
+			"has only internal IP (IPv4)",
 			&apiv1.Node{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "test-node",
@@ -137,11 +143,14 @@ func Test_GetNodeIP(t *testing.T) {
 					},
 				},
 			},
+			true,
+			false,
 			net.ParseIP("10.0.0.1"),
+			nil,
 			nil,
 		},
 		{
-			"has only external IP",
+			"has only external IP (IPv4)",
 			&apiv1.Node{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "test-node",
@@ -155,7 +164,160 @@ func Test_GetNodeIP(t *testing.T) {
 					},
 				},
 			},
+			true,
+			false,
 			net.ParseIP("1.1.1.1"),
+			nil,
+			nil,
+		},
+		{
+			"has external and internal IPs (IPv6)",
+			&apiv1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-node",
+				},
+				Status: apiv1.NodeStatus{
+					Addresses: []apiv1.NodeAddress{
+						{
+							Type:    apiv1.NodeInternalIP,
+							Address: "2001:db8:42:1::1",
+						},
+						{
+							Type:    apiv1.NodeExternalIP,
+							Address: "a00:100::1",
+						},
+					},
+				},
+			},
+			false,
+			true,
+			nil,
+			net.ParseIP("2001:db8:42:1::1"),
+			nil,
+		},
+		{
+			"has only internal IP (IPv6)",
+			&apiv1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-node",
+				},
+				Status: apiv1.NodeStatus{
+					Addresses: []apiv1.NodeAddress{
+						{
+							Type:    apiv1.NodeInternalIP,
+							Address: "2001:db8:42:1::1",
+						},
+					},
+				},
+			},
+			false,
+			true,
+			nil,
+			net.ParseIP("2001:db8:42:1::1"),
+			nil,
+		},
+		{
+			"has only external IP (IPv6)",
+			&apiv1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-node",
+				},
+				Status: apiv1.NodeStatus{
+					Addresses: []apiv1.NodeAddress{
+						{
+							Type:    apiv1.NodeExternalIP,
+							Address: "a00:100::1",
+						},
+					},
+				},
+			},
+			false,
+			true,
+			nil,
+			net.ParseIP("a00:100::1"),
+			nil,
+		},
+		{
+			"has external and internal IPs (dual-stack)",
+			&apiv1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-node",
+				},
+				Status: apiv1.NodeStatus{
+					Addresses: []apiv1.NodeAddress{
+						{
+							Type:    apiv1.NodeInternalIP,
+							Address: "10.0.0.1",
+						},
+						{
+							Type:    apiv1.NodeInternalIP,
+							Address: "2001:db8:42:1::1",
+						},
+						{
+							Type:    apiv1.NodeExternalIP,
+							Address: "1.1.1.1",
+						},
+						{
+							Type:    apiv1.NodeExternalIP,
+							Address: "a00:100::1",
+						},
+					},
+				},
+			},
+			true,
+			true,
+			net.ParseIP("10.0.0.1"),
+			net.ParseIP("2001:db8:42:1::1"),
+			nil,
+		},
+		{
+			"has only internal IP (dual-stack)",
+			&apiv1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-node",
+				},
+				Status: apiv1.NodeStatus{
+					Addresses: []apiv1.NodeAddress{
+						{
+							Type:    apiv1.NodeInternalIP,
+							Address: "10.0.0.1",
+						},
+						{
+							Type:    apiv1.NodeInternalIP,
+							Address: "2001:db8:42:1::1",
+						},
+					},
+				},
+			},
+			true,
+			true,
+			net.ParseIP("10.0.0.1"),
+			net.ParseIP("2001:db8:42:1::1"),
+			nil,
+		},
+		{
+			"has only external IP (dual-stack)",
+			&apiv1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-node",
+				},
+				Status: apiv1.NodeStatus{
+					Addresses: []apiv1.NodeAddress{
+						{
+							Type:    apiv1.NodeExternalIP,
+							Address: "1.1.1.1",
+						},
+						{
+							Type:    apiv1.NodeExternalIP,
+							Address: "a00:100::1",
+						},
+					},
+				},
+			},
+			true,
+			false,
+			net.ParseIP("1.1.1.1"),
+			net.ParseIP("a00:100::1"),
 			nil,
 		},
 		{
@@ -168,6 +330,9 @@ func Test_GetNodeIP(t *testing.T) {
 					Addresses: []apiv1.NodeAddress{},
 				},
 			},
+			true,
+			true,
+			nil,
 			nil,
 			errors.New("host IP unknown"),
 		},
@@ -175,16 +340,22 @@ func Test_GetNodeIP(t *testing.T) {
 
 	for _, testcase := range testcases {
 		t.Run(testcase.name, func(t *testing.T) {
-			ip, err := GetNodeIP(testcase.node)
+			ipv4, ipv6, err := GetNodeIP(testcase.node, testcase.enableIPv4, testcase.enableIPv6)
 			if !reflect.DeepEqual(err, testcase.err) {
 				t.Logf("actual error: %v", err)
 				t.Logf("expected error: %v", testcase.err)
 				t.Error("did not get expected error")
 			}
 
-			if !reflect.DeepEqual(ip, testcase.ip) {
-				t.Logf("actual ip: %v", ip)
-				t.Logf("expected ip: %v", testcase.ip)
+			if !reflect.DeepEqual(ipv4, testcase.ipv4) {
+				t.Logf("actual ip: %v", ipv4)
+				t.Logf("expected ip: %v", testcase.ipv4)
+				t.Error("did not get expected node ip")
+			}
+
+			if !reflect.DeepEqual(ipv4, testcase.ipv6) {
+				t.Logf("actual ip: %v", ipv6)
+				t.Logf("expected ip: %v", testcase.ipv6)
 				t.Error("did not get expected node ip")
 			}
 		})

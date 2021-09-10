@@ -12,6 +12,7 @@ import (
 	apiv1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	netutils "k8s.io/utils/net"
 )
 
 // GetNodeObject returns the node API object for the node
@@ -47,19 +48,41 @@ func GetNodeObject(clientset kubernetes.Interface, hostnameOverride string) (*ap
 // Order of preference:
 // 1. NodeInternalIP
 // 2. NodeExternalIP (Only set on cloud providers usually)
-func GetNodeIP(node *apiv1.Node) (net.IP, error) {
+func GetNodeIP(node *apiv1.Node, enableIPv4, enableIPv6 bool) (net.IP, net.IP, error) {
+	var ipAddrv4, ipAddrv6 net.IP
 	addresses := node.Status.Addresses
 	addressMap := make(map[apiv1.NodeAddressType][]apiv1.NodeAddress)
 	for i := range addresses {
 		addressMap[addresses[i].Type] = append(addressMap[addresses[i].Type], addresses[i])
 	}
 	if addresses, ok := addressMap[apiv1.NodeInternalIP]; ok {
-		return net.ParseIP(addresses[0].Address), nil
+		for _, address := range addresses {
+			if ipAddrv4 == nil && enableIPv4 && netutils.IsIPv4String(address.Address) {
+				ipAddrv4 = net.ParseIP(address.Address)
+			}
+			if ipAddrv6 == nil && enableIPv6 && netutils.IsIPv6String(address.Address) {
+				ipAddrv6 = net.ParseIP(address.Address)
+			}
+		}
 	}
 	if addresses, ok := addressMap[apiv1.NodeExternalIP]; ok {
-		return net.ParseIP(addresses[0].Address), nil
+		for _, address := range addresses {
+			if ipAddrv4 == nil && enableIPv4 && netutils.IsIPv4String(address.Address) {
+				ipAddrv4 = net.ParseIP(address.Address)
+			}
+			if ipAddrv6 == nil && enableIPv6 && netutils.IsIPv6String(address.Address) {
+				ipAddrv6 = net.ParseIP(address.Address)
+			}
+		}
 	}
-	return nil, errors.New("host IP unknown")
+
+	if enableIPv4 && ipAddrv4 == nil {
+		return nil, nil, errors.New("host IPv4 unknown")
+	}
+	if enableIPv6 && ipAddrv6 == nil {
+		return nil, nil, errors.New("host IPv6 unknown")
+	}
+	return ipAddrv4, ipAddrv6, nil
 }
 
 // GetMTUFromNodeIP returns the MTU by detecting it from the IP on the node and figuring in tunneling configurations

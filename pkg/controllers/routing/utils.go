@@ -95,7 +95,7 @@ func ipv6IsEnabled() bool {
 	return true
 }
 
-func getNodeSubnet(nodeIP net.IP) (net.IPNet, string, error) {
+func getNodeSubnet(nodeIPv4, nodeIPv6 net.IP, enableIPv4, enableIPv6 bool) (net.IPNet, string, error) {
 	links, err := netlink.LinkList()
 	if err != nil {
 		return net.IPNet{}, "", errors.New("failed to get list of links")
@@ -106,7 +106,10 @@ func getNodeSubnet(nodeIP net.IP) (net.IPNet, string, error) {
 			return net.IPNet{}, "", errors.New("failed to get list of addr")
 		}
 		for _, addr := range addresses {
-			if addr.IPNet.IP.Equal(nodeIP) {
+			if enableIPv4 && addr.IPNet.IP.Equal(nodeIPv4) {
+				return *addr.IPNet, link.Attrs().Name, nil
+			}
+			if enableIPv6 && addr.IPNet.IP.Equal(nodeIPv6) {
 				return *addr.IPNet, link.Attrs().Name, nil
 			}
 		}

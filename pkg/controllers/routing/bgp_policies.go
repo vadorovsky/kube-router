@@ -77,23 +77,28 @@ func (nrc *NetworkRoutingController) addPodCidrDefinedSet() error {
 		return err
 	}
 	if currentDefinedSet == nil {
-		cidrLen, err := strconv.Atoi(strings.Split(nrc.podCidr, "/")[1])
-		if err != nil || cidrLen < 0 || cidrLen > 32 {
-			return fmt.Errorf("the pod CIDR IP given is not a proper mask: %d", cidrLen)
-		}
-		podCidrDefinedSet := &gobgpapi.DefinedSet{
-			DefinedType: gobgpapi.DefinedType_PREFIX,
-			Name:        "podcidrdefinedset",
-			Prefixes: []*gobgpapi.Prefix{
-				{
-					IpPrefix:      nrc.podCidr,
-					MaskLengthMin: uint32(cidrLen),
-					MaskLengthMax: uint32(cidrLen),
+		// if nrc.enableIPv4 {
+		for _, ipFamilyHandler := range nrc.ipFamilyHandlers {
+			cidrLen, err := strconv.Atoi(strings.Split(ipFamilyHandler.PodCidr, "/")[1])
+			if err != nil || cidrLen < 0 || cidrLen > 32 {
+				return fmt.Errorf("the pod CIDR IP given is not a proper mask: %d", cidrLen)
+			}
+			podCidrDefinedSet := &gobgpapi.DefinedSet{
+				DefinedType: gobgpapi.DefinedType_PREFIX,
+				Name:        "podcidrdefinedset",
+				Prefixes: []*gobgpapi.Prefix{
+					{
+						IpPrefix:      ipFamilyHandler.PodCidr,
+						MaskLengthMin: uint32(cidrLen),
+						MaskLengthMax: uint32(cidrLen),
+					},
 				},
-			},
+			}
+			if err := nrc.bgpServer.AddDefinedSet(context.Background(),
+				&gobgpapi.AddDefinedSetRequest{DefinedSet: podCidrDefinedSet}); err != nil {
+				return err
+			}
 		}
-		return nrc.bgpServer.AddDefinedSet(context.Background(),
-			&gobgpapi.AddDefinedSetRequest{DefinedSet: podCidrDefinedSet})
 	}
 	return nil
 }
@@ -216,12 +221,17 @@ func (nrc *NetworkRoutingController) addiBGPPeersDefinedSet() ([]string, error) 
 	nodes := nrc.nodeLister.List()
 	for _, node := range nodes {
 		nodeObj := node.(*v1core.Node)
-		nodeIP, err := utils.GetNodeIP(nodeObj)
+		nodeIPv4, nodeIPv6, err := utils.GetNodeIP(nodeObj, nrc.enableIPv4, nrc.enableIPv6)
 		if err != nil {
 			klog.Errorf("Failed to find a node IP and therefore cannot add internal BGP Peer: %v", err)
 			continue
 		}
-		iBGPPeerCIDRs = append(iBGPPeerCIDRs, nodeIP.String()+"/32")
+		if nrc.enableIPv4 {
+			iBGPPeerCIDRs = append(iBGPPeerCIDRs, nodeIPv4.String()+"/32")
+		}
+		if nrc.enableIPv6 {
+			iBGPPeerCIDRs = append(iBGPPeerCIDRs, nodeIPv6.String()+"/32")
+		}
 	}
 
 	var currentDefinedSet *gobgpapi.DefinedSet
