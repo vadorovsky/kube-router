@@ -44,7 +44,7 @@ func GetNodeObject(clientset kubernetes.Interface, hostnameOverride string) (*ap
 	return nil, fmt.Errorf("failed to identify the node by NODE_NAME, hostname or --hostname-override")
 }
 
-// GetNodeIP returns the most valid external facing IP address for a node.
+// GetNodeIP returns the most valid external facing IP addresses for a node (IPv4 and IPv6).
 // Order of preference:
 // 1. NodeInternalIP
 // 2. NodeExternalIP (Only set on cloud providers usually)

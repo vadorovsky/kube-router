@@ -54,6 +54,7 @@ var (
 
 type ipFamilyHandler struct {
 	iptablesSaveRestore *utils.IPTablesSaveRestore
+	filterTableRules    bytes.Buffer
 
 	*controllers.IPFamilyHandler
 }
@@ -126,8 +127,6 @@ type NetworkPolicyController struct {
 	PodEventHandler           cache.ResourceEventHandler
 	NamespaceEventHandler     cache.ResourceEventHandler
 	NetworkPolicyEventHandler cache.ResourceEventHandler
-
-	filterTableRules bytes.Buffer
 }
 
 // internal structure to represent a network policy
@@ -151,7 +150,7 @@ type networkPolicyInfo struct {
 
 // internal structure to represent Pod
 type podInfo struct {
-	ip        string
+	ips       []v1core.PodIP
 	name      string
 	namespace string
 	labels    map[string]string
@@ -293,17 +292,17 @@ func (npc *NetworkPolicyController) fullPolicySync() {
 		return
 	}
 
-	npc.filterTableRules.Reset()
 	for _, ipFamilyHandler := range npc.ipFamilyHandlers {
-		if err := ipFamilyHandler.iptablesSaveRestore.SaveInto("filter", &npc.filterTableRules); err != nil {
-			klog.Errorf("Aborting sync. Failed to run iptables-save: %v" + err.Error())
+		ipFamilyHandler.filterTableRules.Reset()
+		if err := ipFamilyHandler.iptablesSaveRestore.SaveInto("filter", &ipFamilyHandler.filterTableRules); err != nil {
+			klog.Errorf("Aborting sync. Failed to run iptables-save: %v", err.Error())
 			return
 		}
 	}
 
 	activePolicyChains, activePolicyIPSets, err := npc.syncNetworkPolicyChains(networkPoliciesInfo, syncVersion)
 	if err != nil {
-		klog.Errorf("Aborting sync. Failed to sync network policy chains: %v" + err.Error())
+		klog.Errorf("Aborting sync. Failed to sync network policy chains: %v", err.Error())
 		return
 	}
 
@@ -320,9 +319,10 @@ func (npc *NetworkPolicyController) fullPolicySync() {
 	}
 
 	for _, ipFamilyHandler := range npc.ipFamilyHandlers {
-		if err := ipFamilyHandler.iptablesSaveRestore.Restore("filter", npc.filterTableRules.Bytes()); err != nil {
+		if err := ipFamilyHandler.iptablesSaveRestore.Restore("filter",
+			ipFamilyHandler.filterTableRules.Bytes()); err != nil {
 			klog.Errorf("Aborting sync. Failed to run iptables-restore: %v\n%s",
-				err.Error(), npc.filterTableRules.String())
+				err.Error(), ipFamilyHandler.filterTableRules.String())
 			return
 		}
 	}
@@ -473,11 +473,13 @@ func (npc *NetworkPolicyController) ensureTopLevelChains() {
 func (npc *NetworkPolicyController) ensureExplicitAccept() {
 	// for the traffic to/from the local pod's let network policy controller be
 	// authoritative entity to ACCEPT the traffic if it complies to network policies
-	for _, chain := range defaultChains {
-		comment := "\"rule to explicitly ACCEPT traffic that comply to network policies\""
-		args := []string{"-m", "comment", "--comment", comment, "-m", "mark", "--mark", "0x20000/0x20000",
-			"-j", "ACCEPT"}
-		npc.filterTableRules = utils.AppendUnique(npc.filterTableRules, chain, args)
+	for _, ipFamilyHandler := range npc.ipFamilyHandlers {
+		for _, chain := range defaultChains {
+			comment := "\"rule to explicitly ACCEPT traffic that comply to network policies\""
+			args := []string{"-m", "comment", "--comment", comment, "-m", "mark", "--mark", "0x20000/0x20000",
+				"-j", "ACCEPT"}
+			ipFamilyHandler.filterTableRules = utils.AppendUnique(ipFamilyHandler.filterTableRules, chain, args)
+		}
 	}
 }
 
@@ -513,80 +515,77 @@ func (npc *NetworkPolicyController) cleanupStaleRules(activePolicyChains, active
 	cleanupPodFwChains := make([]string, 0)
 	cleanupPolicyChains := make([]string, 0)
 
-	iptablesCmdHandler, err := iptables.New()
-	if err != nil {
-		return fmt.Errorf("failed to initialize iptables command executor due to %w", err)
-	}
+	for _, ipFamilyHandler := range npc.ipFamilyHandlers {
+		// find iptables chains and ipsets that are no longer used by comparing current to the active maps we were passed
+		chains, err := ipFamilyHandler.IptablesCmdHandler.ListChains("filter")
+		if err != nil {
+			return fmt.Errorf("unable to list chains: %w", err)
+		}
+		for _, chain := range chains {
+			if strings.HasPrefix(chain, kubeNetworkPolicyChainPrefix) {
+				if chain == kubeDefaultNetpolChain {
+					continue
+				}
+				if _, ok := activePolicyChains[chain]; !ok {
+					cleanupPolicyChains = append(cleanupPolicyChains, chain)
+					continue
+				}
+			}
+			if strings.HasPrefix(chain, kubePodFirewallChainPrefix) {
+				if _, ok := activePodFwChains[chain]; !ok {
+					cleanupPodFwChains = append(cleanupPodFwChains, chain)
+					continue
+				}
+			}
+		}
 
-	// find iptables chains and ipsets that are no longer used by comparing current to the active maps we were passed
-	chains, err := iptablesCmdHandler.ListChains("filter")
-	if err != nil {
-		return fmt.Errorf("unable to list chains: %w", err)
-	}
-	for _, chain := range chains {
-		if strings.HasPrefix(chain, kubeNetworkPolicyChainPrefix) {
-			if chain == kubeDefaultNetpolChain {
-				continue
-			}
-			if _, ok := activePolicyChains[chain]; !ok {
-				cleanupPolicyChains = append(cleanupPolicyChains, chain)
-				continue
-			}
+		var newChains, newRules, desiredFilterTable bytes.Buffer
+		rules := strings.Split(ipFamilyHandler.filterTableRules.String(), "\n")
+		if len(rules) > 0 && rules[len(rules)-1] == "" {
+			rules = rules[:len(rules)-1]
 		}
-		if strings.HasPrefix(chain, kubePodFirewallChainPrefix) {
-			if _, ok := activePodFwChains[chain]; !ok {
-				cleanupPodFwChains = append(cleanupPodFwChains, chain)
-				continue
-			}
-		}
-	}
-
-	var newChains, newRules, desiredFilterTable bytes.Buffer
-	rules := strings.Split(npc.filterTableRules.String(), "\n")
-	if len(rules) > 0 && rules[len(rules)-1] == "" {
-		rules = rules[:len(rules)-1]
-	}
-	for _, rule := range rules {
-		skipRule := false
-		for _, podFWChainName := range cleanupPodFwChains {
-			if strings.Contains(rule, podFWChainName) {
-				skipRule = true
-				break
-			}
-		}
-		for _, policyChainName := range cleanupPolicyChains {
-			if strings.Contains(rule, policyChainName) {
-				skipRule = true
-				break
-			}
-		}
-		if deleteDefaultChains {
-			for _, chain := range []string{kubeInputChainName, kubeForwardChainName, kubeOutputChainName,
-				kubeDefaultNetpolChain} {
-				if strings.Contains(rule, chain) {
+		for _, rule := range rules {
+			skipRule := false
+			for _, podFWChainName := range cleanupPodFwChains {
+				if strings.Contains(rule, podFWChainName) {
 					skipRule = true
 					break
 				}
 			}
+			for _, policyChainName := range cleanupPolicyChains {
+				if strings.Contains(rule, policyChainName) {
+					skipRule = true
+					break
+				}
+			}
+			if deleteDefaultChains {
+				for _, chain := range []string{kubeInputChainName, kubeForwardChainName, kubeOutputChainName,
+					kubeDefaultNetpolChain} {
+					if strings.Contains(rule, chain) {
+						skipRule = true
+						break
+					}
+				}
+			}
+			if strings.Contains(rule, "COMMIT") || strings.HasPrefix(rule, "# ") {
+				skipRule = true
+			}
+			if skipRule {
+				continue
+			}
+			if strings.HasPrefix(rule, ":") {
+				newChains.WriteString(rule + " - [0:0]\n")
+			}
+			if strings.HasPrefix(rule, "-") {
+				newRules.WriteString(rule + "\n")
+			}
 		}
-		if strings.Contains(rule, "COMMIT") || strings.HasPrefix(rule, "# ") {
-			skipRule = true
-		}
-		if skipRule {
-			continue
-		}
-		if strings.HasPrefix(rule, ":") {
-			newChains.WriteString(rule + " - [0:0]\n")
-		}
-		if strings.HasPrefix(rule, "-") {
-			newRules.WriteString(rule + "\n")
-		}
+		desiredFilterTable.WriteString("*filter" + "\n")
+		desiredFilterTable.Write(newChains.Bytes())
+		desiredFilterTable.Write(newRules.Bytes())
+		desiredFilterTable.WriteString("COMMIT" + "\n")
+		ipFamilyHandler.filterTableRules = desiredFilterTable
 	}
-	desiredFilterTable.WriteString("*filter" + "\n")
-	desiredFilterTable.Write(newChains.Bytes())
-	desiredFilterTable.Write(newRules.Bytes())
-	desiredFilterTable.WriteString("COMMIT" + "\n")
-	npc.filterTableRules = desiredFilterTable
 
 	return nil
 }
@@ -642,7 +641,7 @@ func (npc *NetworkPolicyController) Cleanup() {
 	var emptySet map[string]bool
 	// Take a dump (iptables-save) of the current filter table for cleanupStaleRules() to work on
 	for _, ipFamilyHandler := range npc.ipFamilyHandlers {
-		if err := ipFamilyHandler.iptablesSaveRestore.SaveInto("filter", &npc.filterTableRules); err != nil {
+		if err := ipFamilyHandler.iptablesSaveRestore.SaveInto("filter", &ipFamilyHandler.filterTableRules); err != nil {
 			klog.Errorf("error encountered attempting to list iptables rules for cleanup: %v", err)
 			return
 		}
@@ -656,10 +655,10 @@ func (npc *NetworkPolicyController) Cleanup() {
 	}
 	// Restore (iptables-restore) npc's cleaned up version of the iptables filter chain
 	for _, ipFamilyHandler := range npc.ipFamilyHandlers {
-		if err = ipFamilyHandler.iptablesSaveRestore.Restore("filter", npc.filterTableRules.Bytes()); err != nil {
+		if err = ipFamilyHandler.iptablesSaveRestore.Restore("filter", ipFamilyHandler.filterTableRules.Bytes()); err != nil {
 			klog.Errorf(
 				"error encountered while loading running iptables-restore: %v\n%s", err,
-				npc.filterTableRules.String())
+				ipFamilyHandler.filterTableRules.String())
 		}
 	}
 

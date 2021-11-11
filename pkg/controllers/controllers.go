@@ -3,6 +3,8 @@ package controllers
 import (
 	"net"
 
+	"github.com/cloudnativelabs/kube-router/pkg/utils"
+
 	"github.com/coreos/go-iptables/iptables"
 	v1core "k8s.io/api/core/v1"
 )
@@ -10,6 +12,7 @@ import (
 type IPFamilyHandler struct {
 	Family             v1core.IPFamily
 	IptablesCmdHandler *iptables.IPTables
+	IPSetHandler       *utils.IPSet
 	NodeIP             net.IP
 	PodCidr            string
 	BridgeIfName       string

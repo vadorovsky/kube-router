@@ -8,6 +8,7 @@ import (
 
 	"github.com/cloudnativelabs/kube-router/pkg/utils"
 	api "k8s.io/api/core/v1"
+	utilsnet "k8s.io/utils/net"
 )
 
 const (
@@ -69,40 +70,85 @@ func validateNodePortRange(nodePortOption string) (string, error) {
 	return fmt.Sprintf("%d:%d", port1, port2), nil
 }
 
-func getIPsFromPods(pods []podInfo) []string {
-	ips := make([]string, len(pods))
-	for idx, pod := range pods {
-		ips[idx] = pod.ip
+func getIPsFromPods(pods []podInfo, family api.IPFamily) []string {
+	var ips []string
+	for _, pod := range pods {
+		switch family {
+		case api.IPv4Protocol:
+			ip, _ := getPodIPv4Address(pod)
+			ips = append(ips, ip)
+		case api.IPv6Protocol:
+			ip, _ := getPodIPv6Address(pod)
+			ips = append(ips, ip)
+		}
 	}
 	return ips
 }
 
-func (npc *NetworkPolicyController) createGenericHashIPSet(ipsetName, hashType string, ips []string) {
+func (npc *NetworkPolicyController) createGenericHashIPSet(ipsetName, hashType string, ips []string,
+	ipFamilyHandler *ipFamilyHandler) {
 	setEntries := make([][]string, 0)
-	for _, ip := range ips {
-		setEntries = append(setEntries, []string{ip, utils.OptionTimeout, "0"})
+	switch ipFamilyHandler.Family {
+	case api.IPv4Protocol:
+		for _, ip := range ips {
+			if !utilsnet.IsIPv4String(ip) {
+				fmt.Printf("MANU - Something is wrong at createGenericHashIPSet. ip: %#v is not IPV4", ip)
+			}
+			setEntries = append(setEntries, []string{ip, utils.OptionTimeout, "0"})
+		}
+		ipFamilyHandler.IPSetHandler.RefreshSet(ipsetName, setEntries, hashType)
+	case api.IPv6Protocol:
+		for _, ip := range ips {
+			if !utilsnet.IsIPv6String(ip) {
+				fmt.Printf("MANU - Something is wrong at createGenericHashIPSet. ip: %#v is not IPV6", ip)
+			}
+			setEntries = append(setEntries, []string{ip, utils.OptionTimeout, "0"})
+		}
+		fmt.Printf("MANUEL - createGenericHashIPSet. Before RefreshSet. These are the ipset.Sets: %#v, "+
+			"the setEntries: %#v and the hashType: %#v\n", ipFamilyHandler.IPSetHandler.Sets, setEntries, hashType)
+		ipFamilyHandler.IPSetHandler.RefreshSet(ipsetName, setEntries, hashType)
 	}
-	npc.ipSetHandler.RefreshSet(ipsetName, setEntries, hashType)
 }
 
 // createPolicyIndexedIPSet creates a policy based ipset and indexes it as an active ipset
 func (npc *NetworkPolicyController) createPolicyIndexedIPSet(
-	activePolicyIPSets map[string]bool, ipsetName, hashType string, ips []string) {
+	activePolicyIPSets map[string]bool, ipsetName, hashType string, ips []string, ipFamilyHandler *ipFamilyHandler) {
 	activePolicyIPSets[ipsetName] = true
-	npc.createGenericHashIPSet(ipsetName, hashType, ips)
+	npc.createGenericHashIPSet(ipsetName, hashType, ips, ipFamilyHandler)
 }
 
 // createPodWithPortPolicyRule handles the case where port details are provided by the ingress/egress rule and creates
 // an iptables rule that matches on both the source/dest IPs and the port
 func (npc *NetworkPolicyController) createPodWithPortPolicyRule(
-	ports []protocolAndPort, policy networkPolicyInfo, policyName string, srcSetName string, dstSetName string) error {
+	ports []protocolAndPort, policy networkPolicyInfo, policyName string, srcSetName string, dstSetName string,
+	ipFamilyHandler *ipFamilyHandler) error {
 	for _, portProtocol := range ports {
 		comment := "rule to ACCEPT traffic from source pods to dest pods selected by policy name " +
 			policy.name + " namespace " + policy.namespace
 		if err := npc.appendRuleToPolicyChain(policyName, comment, srcSetName, dstSetName, portProtocol.protocol,
-			portProtocol.port, portProtocol.endport); err != nil {
+			portProtocol.port, portProtocol.endport, ipFamilyHandler); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func getPodIPv6Address(pod podInfo) (string, error) {
+	fmt.Printf("MANU - Inside getPodIPv6Address. These are the pod.ips: %#v\n", pod.ips)
+	for _, ip := range pod.ips {
+		fmt.Printf("MANU - This is the IP: %#v\n", ip.IP)
+		if utilsnet.IsIPv6String(ip.IP) {
+			return ip.IP, nil
+		}
+	}
+	return "", fmt.Errorf("the pod has no IPv6Address")
+}
+
+func getPodIPv4Address(pod podInfo) (string, error) {
+	for _, ip := range pod.ips {
+		if utilsnet.IsIPv4String(ip.IP) {
+			return ip.IP, nil
+		}
+	}
+	return "", fmt.Errorf("the pod has no IPv4Address")
 }

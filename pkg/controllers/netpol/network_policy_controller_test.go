@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -137,14 +139,14 @@ func tNewPodNamespaceMapFromTC(target map[string]string) tPodNamespaceMap {
 func tCreateFakePods(t *testing.T, podInformer cache.SharedIndexInformer, nsInformer cache.SharedIndexInformer) {
 	podNamespaceMap := make(tPodNamespaceMap)
 	pods := []podInfo{
-		{name: "Aa", labels: labels.Set{"app": "a"}, namespace: "nsA", ip: "1.1"},
-		{name: "Aaa", labels: labels.Set{"app": "a", "component": "a"}, namespace: "nsA", ip: "1.2"},
-		{name: "Aab", labels: labels.Set{"app": "a", "component": "b"}, namespace: "nsA", ip: "1.3"},
-		{name: "Aac", labels: labels.Set{"app": "a", "component": "c"}, namespace: "nsA", ip: "1.4"},
-		{name: "Ba", labels: labels.Set{"app": "a"}, namespace: "nsB", ip: "2.1"},
-		{name: "Baa", labels: labels.Set{"app": "a", "component": "a"}, namespace: "nsB", ip: "2.2"},
-		{name: "Bab", labels: labels.Set{"app": "a", "component": "b"}, namespace: "nsB", ip: "2.3"},
-		{name: "Ca", labels: labels.Set{"app": "a"}, namespace: "nsC", ip: "3.1"},
+		{name: "Aa", labels: labels.Set{"app": "a"}, namespace: "nsA", ips: []v1.PodIP{{IP: "1.1.1.1"}}},
+		{name: "Aaa", labels: labels.Set{"app": "a", "component": "a"}, namespace: "nsA", ips: []v1.PodIP{{IP: "1.2.3.4"}}},
+		{name: "Aab", labels: labels.Set{"app": "a", "component": "b"}, namespace: "nsA", ips: []v1.PodIP{{IP: "1.3.2.2"}}},
+		{name: "Aac", labels: labels.Set{"app": "a", "component": "c"}, namespace: "nsA", ips: []v1.PodIP{{IP: "1.4.2.2"}}},
+		{name: "Ba", labels: labels.Set{"app": "a"}, namespace: "nsB", ips: []v1.PodIP{{IP: "2.1.1.1"}}},
+		{name: "Baa", labels: labels.Set{"app": "a", "component": "a"}, namespace: "nsB", ips: []v1.PodIP{{IP: "2.2.2.2"}}},
+		{name: "Bab", labels: labels.Set{"app": "a", "component": "b"}, namespace: "nsB", ips: []v1.PodIP{{IP: "2.3.2.2"}}},
+		{name: "Ca", labels: labels.Set{"app": "a"}, namespace: "nsC", ips: []v1.PodIP{{IP: "3.1"}}},
 	}
 	namespaces := []tNamespaceMeta{
 		{name: "nsA", labels: labels.Set{"name": "a", "team": "a"}},
@@ -155,7 +157,8 @@ func tCreateFakePods(t *testing.T, podInformer cache.SharedIndexInformer, nsInfo
 	ipsUsed := make(map[string]bool)
 	for _, pod := range pods {
 		podNamespaceMap.addPod(pod)
-		ipaddr := "1.1." + pod.ip
+		// TODO: test multiple IPs
+		ipaddr := pod.ips[0].IP
 		if ipsUsed[ipaddr] {
 			t.Fatalf("there is another pod with the same Ip address %s as this pod %s namespace %s",
 				ipaddr, pod.name, pod.name)
@@ -190,6 +193,11 @@ func newUneventfulNetworkPolicyController(podInformer cache.SharedIndexInformer,
 
 	npc := NetworkPolicyController{}
 	npc.syncPeriod = time.Hour
+
+	// TODO: Handle both IP families
+	npc.ipFamilyHandlers = make(map[uint16]*ipFamilyHandler)
+	ipv4Handler, _ := newIPFamilyHandler(v1.IPv4Protocol, net.IPv4(10, 10, 10, 10))
+	npc.ipFamilyHandlers[syscall.AF_INET] = ipv4Handler
 
 	npc.nodeHostName = "node"
 	// npc.nodeIPv4 = net.IPv4(10, 10, 10, 10)
@@ -538,38 +546,39 @@ func TestNetworkPolicyBuilder(t *testing.T) {
 		if err != nil {
 			t.Errorf("Problems building policies: %s", err)
 		}
-		for _, np := range netpols {
-			fmt.Printf(np.policyType)
-			if np.policyType == kubeEgressPolicyType || np.policyType == kubeBothPolicyType {
-				err = krNetPol.processEgressRules(np, "", nil, "1")
-				if err != nil {
-					t.Errorf("Error syncing the rules: %s", err)
+		for _, ipFamilyHandler := range krNetPol.ipFamilyHandlers {
+			for _, np := range netpols {
+				fmt.Printf(np.policyType)
+				if np.policyType == kubeEgressPolicyType || np.policyType == kubeBothPolicyType {
+					err = krNetPol.processEgressRules(np, "", nil, "1", ipFamilyHandler)
+					if err != nil {
+						t.Errorf("Error syncing the rules: %s", err)
+					}
+				}
+				if np.policyType == kubeIngressPolicyType || np.policyType == kubeBothPolicyType {
+					err = krNetPol.processIngressRules(np, "", nil, "1", ipFamilyHandler)
+					if err != nil {
+						t.Errorf("Error syncing the rules: %s", err)
+					}
 				}
 			}
-			if np.policyType == kubeIngressPolicyType || np.policyType == kubeBothPolicyType {
-				err = krNetPol.processIngressRules(np, "", nil, "1")
-				if err != nil {
-					t.Errorf("Error syncing the rules: %s", err)
-				}
-			}
-		}
 
-		if !bytes.Equal([]byte(test.expectedRule), krNetPol.filterTableRules.Bytes()) {
-			t.Errorf("Invalid rule %s created:\nExpected:\n%s \nGot:\n%s", test.name, test.expectedRule, krNetPol.filterTableRules.String())
-		}
-		key := fmt.Sprintf("%s/%s", test.netpol.namespace, test.netpol.name)
-		obj, exists, err := krNetPol.npLister.GetByKey(key)
-		if err != nil {
-			t.Errorf("Failed to get Netpol from store: %s", err)
-		}
-		if exists {
-			err = krNetPol.npLister.Delete(obj)
+			if !bytes.Equal([]byte(test.expectedRule), ipFamilyHandler.filterTableRules.Bytes()) {
+				t.Errorf("Invalid rule %s created:\nExpected:\n%s \nGot:\n%s", test.name, test.expectedRule, ipFamilyHandler.filterTableRules.String())
+			}
+			key := fmt.Sprintf("%s/%s", test.netpol.namespace, test.netpol.name)
+			obj, exists, err := krNetPol.npLister.GetByKey(key)
 			if err != nil {
-				t.Errorf("Failed to remove Netpol from store: %s", err)
+				t.Errorf("Failed to get Netpol from store: %s", err)
 			}
+			if exists {
+				err = krNetPol.npLister.Delete(obj)
+				if err != nil {
+					t.Errorf("Failed to remove Netpol from store: %s", err)
+				}
+			}
+			ipFamilyHandler.filterTableRules.Reset()
 		}
-		krNetPol.filterTableRules.Reset()
-
 	}
 
 }
